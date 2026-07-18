@@ -26,7 +26,7 @@ void VoiceProbabilityDelayUnit::Initialize(int delay_num_samples,
   RTC_DCHECK_GE(delay_num_samples, 0);
   RTC_DCHECK_LE(delay_num_samples, sample_rate_hz / 50)
       << "The implementation does not support delays greater than 20 ms.";
-  int frame_size = rtc::CheckedDivExact(sample_rate_hz, 100);  // 10 ms.
+  int frame_size = CheckedDivExact(sample_rate_hz, 100);  // 10 ms.
   if (delay_num_samples <= frame_size) {
     weights_[0] = 0.0f;
     weights_[1] = static_cast<float>(delay_num_samples) / frame_size;
