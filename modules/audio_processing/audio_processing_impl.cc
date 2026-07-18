@@ -1926,13 +1926,13 @@ void AudioProcessingImpl::InitializeTransientSuppressor() {
     submodules_.transient_suppressor =
         std::make_unique<TransientSuppressorImpl>(
             TransientSuppressor::VadMode::kDefault,
-            proc_fullband_sample_rate_hz(), capture_nonlocked_.split_rate,
+            proc_fullband_sample_rate_hz(), proc_split_sample_rate_hz(),
             num_proc_channels());
     return;
   }
 
   submodules_.transient_suppressor->Initialize(
-      proc_fullband_sample_rate_hz(), capture_nonlocked_.split_rate,
+      proc_fullband_sample_rate_hz(), proc_split_sample_rate_hz(),
       num_proc_channels());
 }
 

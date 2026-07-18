@@ -85,7 +85,7 @@ TEST(WPDTreeTest, CorrectnessBasedOnMatlabFiles) {
 
   for (int i = 0; i < kLeaves; ++i) {
     // Matlab files.
-    rtc::StringBuilder matlab_stream;
+    StringBuilder matlab_stream;
     matlab_stream << "audio_processing/transient/wpd" << i;
     std::string matlab_string = test::ResourcePath(matlab_stream.str(), "dat");
     matlab_files_data[i] = FileWrapper::OpenReadOnly(matlab_string);
@@ -94,7 +94,7 @@ TEST(WPDTreeTest, CorrectnessBasedOnMatlabFiles) {
     ASSERT_TRUE(file_opened) << "File could not be opened.\n" << matlab_string;
 
     // Out files.
-    rtc::StringBuilder out_stream;
+    StringBuilder out_stream;
     out_stream << test::OutputPath() << "wpd_" << i << ".out";
     std::string out_string = out_stream.str();
 

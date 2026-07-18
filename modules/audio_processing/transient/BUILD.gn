@@ -97,7 +97,6 @@ if (rtc_include_tests) {
         "//testing/gtest",
         "//third_party/abseil-cpp/absl/flags:flag",
         "//third_party/abseil-cpp/absl/flags:parse",
-        "//third_party/abseil-cpp/absl/types:optional",
       ]
     }
   }
@@ -124,7 +123,6 @@ if (rtc_include_tests) {
     "../../../test:test_support",
     "//testing/gtest",
     "//third_party/abseil-cpp/absl/strings:string_view",
-    "//third_party/abseil-cpp/absl/types:optional",
   ]
 
   rtc_library("transient_suppression_unittests") {
