@@ -26,6 +26,7 @@ RTC_OBJC_EXPORT
 @property(nonatomic, assign) BOOL isEchoCancellationMobileMode;
 
 @property(nonatomic, assign) BOOL isNoiseSuppressionEnabled;
+@property(nonatomic, assign) BOOL isTransientSuppressionEnabled;
 @property(nonatomic, assign) BOOL isHighpassFilterEnabled;
 
 @property(nonatomic, assign) BOOL isAutoGainControl1Enabled;

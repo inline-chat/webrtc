@@ -218,6 +218,7 @@ rtc_library("audio_processing") {
     "agc2:input_volume_stats_reporter",
     "capture_levels_adjuster",
     "ns",
+    "transient:transient_suppressor_impl",
     "vad",
     "//third_party/abseil-cpp/absl/base:nullability",
     "//third_party/abseil-cpp/absl/strings:string_view",
