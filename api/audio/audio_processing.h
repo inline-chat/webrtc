@@ -211,8 +211,9 @@ class RTC_EXPORT AudioProcessing : public RefCountInterface {
       bool analyze_linear_aec_output_when_available = false;
     } noise_suppression;
 
-    // TODO(bugs.webrtc.org/357281131): Deprecated. Stop using and remove.
-    // Enables transient suppression.
+    // Enables transient suppression for short noises such as keyboard clicks.
+    // Call `set_stream_key_pressed()` for each capture chunk so the suppressor
+    // can distinguish active typing.
     struct TransientSuppression {
       bool enabled = false;
     } transient_suppression;

@@ -56,6 +56,7 @@
 #include "modules/audio_processing/post_filter.h"
 #include "modules/audio_processing/render_queue_item_verifier.h"
 #include "modules/audio_processing/rms_level.h"
+#include "modules/audio_processing/transient/transient_suppressor_impl.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/denormal_disabler.h"
 #include "rtc_base/logging.h"
@@ -365,7 +366,8 @@ bool AudioProcessingImpl::SubmoduleStates::Update(
     bool adaptive_gain_controller_enabled,
     bool gain_controller2_enabled,
     bool gain_adjustment_enabled,
-    bool echo_controller_enabled) {
+    bool echo_controller_enabled,
+    bool transient_suppressor_enabled) {
   bool changed = false;
   changed |= (high_pass_filter_enabled != high_pass_filter_enabled_);
   changed |=
@@ -376,6 +378,7 @@ bool AudioProcessingImpl::SubmoduleStates::Update(
   changed |= (gain_controller2_enabled != gain_controller2_enabled_);
   changed |= (gain_adjustment_enabled != gain_adjustment_enabled_);
   changed |= (echo_controller_enabled != echo_controller_enabled_);
+  changed |= (transient_suppressor_enabled != transient_suppressor_enabled_);
   if (changed) {
     high_pass_filter_enabled_ = high_pass_filter_enabled;
     mobile_echo_controller_enabled_ = mobile_echo_controller_enabled;
@@ -384,6 +387,7 @@ bool AudioProcessingImpl::SubmoduleStates::Update(
     gain_controller2_enabled_ = gain_controller2_enabled;
     gain_adjustment_enabled_ = gain_adjustment_enabled;
     echo_controller_enabled_ = echo_controller_enabled;
+    transient_suppressor_enabled_ = transient_suppressor_enabled;
   }
 
   changed |= first_update_;
@@ -613,6 +617,7 @@ void AudioProcessingImpl::InitializeLocked() {
   AllocateRenderQueue();
 
   InitializeGainController1();
+  InitializeTransientSuppressor();
   InitializeHighPassFilter(true);
   InitializeResidualEchoDetector();
   InitializeEchoController();
@@ -726,6 +731,10 @@ void AudioProcessingImpl::ApplyConfig(const AudioProcessing::Config& config) {
       config_.noise_suppression.enabled != config.noise_suppression.enabled ||
       config_.noise_suppression.level != config.noise_suppression.level;
 
+  const bool transient_suppression_config_changed =
+      config_.transient_suppression.enabled !=
+      config.transient_suppression.enabled;
+
   const bool pre_amplifier_config_changed =
       config_.pre_amplifier.enabled != config.pre_amplifier.enabled ||
       config_.pre_amplifier.fixed_gain_factor !=
@@ -742,6 +751,10 @@ void AudioProcessingImpl::ApplyConfig(const AudioProcessing::Config& config) {
 
   if (ns_config_changed) {
     InitializeNoiseSuppressor();
+  }
+
+  if (transient_suppression_config_changed) {
+    InitializeTransientSuppressor();
   }
 
   InitializeHighPassFilter(false);
@@ -1472,6 +1485,20 @@ int AudioProcessingImpl::ProcessCaptureStreamLocked() {
           capture_buffer->channels()[0], capture_buffer->num_frames()));
     }
 
+    if (submodules_.transient_suppressor) {
+      const float voice_probability =
+          submodules_.agc_manager
+              ? submodules_.agc_manager->voice_probability()
+              : 1.0f;
+      submodules_.transient_suppressor->Suppress(
+          capture_buffer->channels()[0], capture_buffer->num_frames(),
+          capture_buffer->num_channels(),
+          capture_buffer->split_bands_const(0)[kBand0To8kHz],
+          capture_buffer->num_frames_per_band(),
+          /*reference_data=*/nullptr, /*reference_length=*/0,
+          voice_probability, capture_.key_pressed);
+    }
+
     // Experimental APM sub-module that analyzes `capture_buffer`.
     if (submodules_.capture_analyzer) {
       submodules_.capture_analyzer->Analyze(capture_buffer);
@@ -1885,7 +1912,28 @@ bool AudioProcessingImpl::UpdateActiveSubmoduleStates() {
       !!submodules_.noise_suppressor, !!submodules_.gain_control,
       !!submodules_.gain_controller2,
       config_.pre_amplifier.enabled || config_.capture_level_adjustment.enabled,
-      NeedEchoController(config_, !!echo_control_factory_));
+      NeedEchoController(config_, !!echo_control_factory_),
+      !!submodules_.transient_suppressor);
+}
+
+void AudioProcessingImpl::InitializeTransientSuppressor() {
+  if (!config_.transient_suppression.enabled) {
+    submodules_.transient_suppressor.reset();
+    return;
+  }
+
+  if (!submodules_.transient_suppressor) {
+    submodules_.transient_suppressor =
+        std::make_unique<TransientSuppressorImpl>(
+            TransientSuppressor::VadMode::kDefault,
+            proc_fullband_sample_rate_hz(), capture_nonlocked_.split_rate,
+            num_proc_channels());
+    return;
+  }
+
+  submodules_.transient_suppressor->Initialize(
+      proc_fullband_sample_rate_hz(), capture_nonlocked_.split_rate,
+      num_proc_channels());
 }
 
 void AudioProcessingImpl::InitializeHighPassFilter(bool forced_reset) {
@@ -2221,6 +2269,8 @@ void AudioProcessingImpl::WriteAecDumpConfigMessage(bool forced) {
 
   apm_config.ns_enabled = config_.noise_suppression.enabled;
   apm_config.ns_level = static_cast<int>(config_.noise_suppression.level);
+  apm_config.transient_suppression_enabled =
+      config_.transient_suppression.enabled;
 
   apm_config.experiments_description = experiments_description;
   apm_config.pre_amplifier_enabled = config_.pre_amplifier.enabled;
