@@ -14,6 +14,11 @@ version `144.7559.11`; it does not build or link this checkout. This repository
 exists so future WebRTC changes can be reviewed and maintained explicitly if a
 source fork ever becomes necessary.
 
+Historical tags `m144.7559.11-inline.4` through
+`m144.7559.11-inline.7` retain the abandoned transient-suppressor experiment
+for auditability. They are unsupported and must not be used for a build. The
+supported stock source pointer is the head of `m144_release`.
+
 ## Current policy
 
 - Do not restore the removed transient suppressor or macOS key-state plumbing.
