@@ -42,8 +42,6 @@
 #endif
 
 #if TARGET_OS_OSX
-#import <ApplicationServices/ApplicationServices.h>
-
 #import "./mac/audio_device_utils_mac.h"
 #endif
 
@@ -72,19 +70,6 @@ bool EngineStateEchoNoisePlatformPathIsActive(const AudioEngineDevice::EngineSta
   return state.voice_processing_enabled && !state.voice_processing_bypassed &&
          (state.built_in_aec_enabled || state.built_in_ns_enabled);
 }
-
-#if TARGET_OS_OSX
-bool IsHardwareKeyPressed() {
-  // Match the proven Noor implementation: report true for every capture frame
-  // while any macOS virtual key is held, not only on the key-down edge.
-  for (CGKeyCode key_code = 0; key_code <= 0x5D; ++key_code) {
-    if (CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, key_code)) {
-      return true;
-    }
-  }
-  return false;
-}
-#endif
 
 // AEC and NS share AVAudioInputNode.voiceProcessingBypassed (one VPIO bypass
 // knob), so keep bypass coupled to the AEC/NS component requests to stay in a
@@ -2642,9 +2627,6 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
           const int16_t* rtc_buffer = (int16_t*)converter_buffer_abl->mBuffers[0].mData;  // Float32
           const int64_t capture_time_ns = timestamp->mHostTime * machTickUnitsToNanoseconds_;
 
-#if TARGET_OS_OSX
-          audio_device_buffer_->SetTypingStatus(IsHardwareKeyPressed());
-#endif
           fine_audio_buffer_->DeliverRecordedData(
               webrtc::ArrayView<const int16_t>(rtc_buffer, frameCount), kFixedRecordDelayEstimate,
               capture_time_ns);
@@ -3140,9 +3122,6 @@ void AudioEngineDevice::StartRenderLoop() {
       const uint64_t capture_time = mach_absolute_time();
       const int64_t capture_time_ns = capture_time * machTickUnitsToNanoseconds_;
 
-#if TARGET_OS_OSX
-      audio_device_buffer_->SetTypingStatus(IsHardwareKeyPressed());
-#endif
       fine_audio_buffer_->DeliverRecordedData(
           webrtc::ArrayView<const int16_t>(rtc_buffer, frames_per_buffer),
           kFixedRecordDelayEstimate, capture_time_ns);

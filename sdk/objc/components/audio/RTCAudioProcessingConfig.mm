@@ -52,16 +52,6 @@
   _config.noise_suppression.enabled = value;
 }
 
-// config.transient_suppression.enabled
-
-- (BOOL)isTransientSuppressionEnabled {
-  return _config.transient_suppression.enabled;
-}
-
-- (void)setIsTransientSuppressionEnabled:(BOOL)value {
-  _config.transient_suppression.enabled = value;
-}
-
 // config.high_pass_filter.enabled
 
 - (BOOL)isHighpassFilterEnabled {

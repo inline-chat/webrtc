@@ -892,24 +892,10 @@ TEST_P(Agc2ParametrizedTest, ProcessSucceedsWhenOneAgcEnabled) {
   }
 }
 
-TEST(AudioProcessingImplTest, AppliesTransientSuppressionConfig) {
-  AudioProcessing::Config config;
-  config.transient_suppression.enabled = true;
-  auto apm =
-      BuiltinAudioProcessingBuilder(config).Build(CreateEnvironment());
-
-  EXPECT_TRUE(apm->GetConfig().transient_suppression.enabled);
-
-  config.transient_suppression.enabled = false;
-  apm->ApplyConfig(config);
-
-  EXPECT_FALSE(apm->GetConfig().transient_suppression.enabled);
-}
-
 TEST_P(Agc2ParametrizedTest,
        BitExactWithAndWithoutTransientSuppressionEnabledInConfig) {
   const Environment env = CreateEnvironment();
-  // With no reported key press, transient suppression must not alter audio.
+  // Enable transient suppression in the config (expect no effect).
   auto config = GetParam();
   config.transient_suppression.enabled = true;
   auto apm = BuiltinAudioProcessingBuilder(config).Build(env);
@@ -948,6 +934,7 @@ TEST_P(Agc2ParametrizedTest,
     volume = apm->recommended_stream_analog_level();
     volume_reference = apm_reference->recommended_stream_analog_level();
     for (int j = 0; j < kSampleRateHz / 100; ++j) {
+      // Expect no effect from transient suppression.
       EXPECT_EQ(buffer[j], buffer_reference[j]);
     }
   }
