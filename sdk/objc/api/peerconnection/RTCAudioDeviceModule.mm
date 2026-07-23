@@ -236,7 +236,7 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
 }
 
 - (BOOL)trySetOutputDevice:(RTC_OBJC_TYPE(RTCIODevice) *)device {
-  return _workerThread->BlockingCall([self, device] {
+  return _workerThread->BlockingCall([self, device]() -> BOOL {
     NSUInteger index = 0;
     NSArray *devices = [self _outputDevices];
 
@@ -257,7 +257,7 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
     // AudioDeviceModule methods use zero for success. Preserve that contract
     // when exposing a Cocoa Boolean instead of inverting every successful
     // route selection.
-    return _native->SetPlayoutDevice(index) == 0;
+    return _native->SetPlayoutDevice(index) == 0 ? YES : NO;
   });
 }
 
@@ -280,7 +280,7 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
 }
 
 - (BOOL)trySetInputDevice:(RTC_OBJC_TYPE(RTCIODevice) *)device {
-  return _workerThread->BlockingCall([self, device] {
+  return _workerThread->BlockingCall([self, device]() -> BOOL {
     NSUInteger index = 0;
     NSArray *devices = [self _inputDevices];
 
@@ -298,7 +298,7 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
       }
     }
 
-    return _native->SetRecordingDevice(index) == 0;
+    return _native->SetRecordingDevice(index) == 0 ? YES : NO;
   });
 }
 
