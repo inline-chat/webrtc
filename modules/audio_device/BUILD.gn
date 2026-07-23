@@ -433,6 +433,7 @@ if (is_mac) {
       "ApplicationServices.framework",
 
       "AudioToolbox.framework",
+      "AVFoundation.framework",
       "CoreAudio.framework",
 
       # Needed for CGEventSourceKeyState in audio_device_mac.cc:

@@ -73,6 +73,10 @@ typedef struct {
   uint64_t recordingCallbackAgeMilliseconds;
   uint16_t measuredPlayoutDelayMilliseconds;
   uint16_t measuredRecordingDelayMilliseconds;
+  double configuredPlayoutSampleRate;
+  double configuredRecordingSampleRate;
+  uint32_t configuredPlayoutChannels;
+  uint32_t configuredRecordingChannels;
 } RTC_OBJC_TYPE(RTCAudioEngineRuntimeDiagnostics);
 
 typedef struct {

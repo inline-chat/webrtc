@@ -405,6 +405,14 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
         native.measured_playout_delay_ms;
     diagnostics.measuredRecordingDelayMilliseconds =
         native.measured_recording_delay_ms;
+    diagnostics.configuredPlayoutSampleRate =
+        native.configured_playout_sample_rate;
+    diagnostics.configuredRecordingSampleRate =
+        native.configured_recording_sample_rate;
+    diagnostics.configuredPlayoutChannels =
+        native.configured_playout_channels;
+    diagnostics.configuredRecordingChannels =
+        native.configured_recording_channels;
     return diagnostics;
   });
 }

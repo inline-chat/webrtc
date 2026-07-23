@@ -1411,6 +1411,7 @@ int32_t AudioEngineDevice::GetEngineState(EngineState* state) {
 
 AudioEngineDevice::RuntimeDiagnostics
 AudioEngineDevice::GetRuntimeDiagnostics() const {
+  RTC_DCHECK_RUN_ON(thread_);
   const uint64_t last_playout =
       last_playout_callback_mach_ticks_.load(std::memory_order_relaxed);
   const uint64_t last_recording =
@@ -1430,6 +1431,12 @@ AudioEngineDevice::GetRuntimeDiagnostics() const {
       measured_playout_delay_ms_.load(std::memory_order_relaxed);
   diagnostics.measured_recording_delay_ms =
       measured_record_delay_ms_.load(std::memory_order_relaxed);
+  diagnostics.configured_playout_sample_rate =
+      configured_playout_sample_rate_;
+  diagnostics.configured_recording_sample_rate =
+      configured_recording_sample_rate_;
+  diagnostics.configured_playout_channels = configured_playout_channels_;
+  diagnostics.configured_recording_channels = configured_recording_channels_;
   return diagnostics;
 }
 
@@ -1875,6 +1882,10 @@ bool AudioEngineDevice::ForceLocalAudioQuiescence() {
   last_playout_callback_mach_ticks_.store(0, std::memory_order_relaxed);
   recording_callback_count_.store(0, std::memory_order_relaxed);
   last_recording_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+  configured_playout_sample_rate_ = 0;
+  configured_playout_channels_ = 0;
+  configured_recording_sample_rate_ = 0;
+  configured_recording_channels_ = 0;
 
 #if TARGET_OS_OSX
   const bool aggregate_destroyed = DestroyAggregateDeviceIfNeeded();
@@ -2879,6 +2890,14 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
                                            channels:1
                                         interleaved:YES];
 
+    configured_playout_sample_rate_ = rtc_output_format.sampleRate;
+    configured_playout_channels_ = rtc_output_format.channelCount;
+    rollback_actions.push_back([this]() {
+      RTC_DCHECK_RUN_ON(thread_);
+      configured_playout_sample_rate_ = 0;
+      configured_playout_channels_ = 0;
+    });
+
     AVAudioSourceNodeRenderBlock source_block =
         ^OSStatus(BOOL* isSilence, const AudioTimeStamp* timestamp, AVAudioFrameCount frameCount,
                   AudioBufferList* outputData) {
@@ -2981,6 +3000,8 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
     measured_playout_delay_ms_.store(0, std::memory_order_relaxed);
     playout_callback_count_.store(0, std::memory_order_relaxed);
     last_playout_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+    configured_playout_sample_rate_ = 0;
+    configured_playout_channels_ = 0;
   }
 
   // --------------------------------------------------------------------------------------------
@@ -3051,6 +3072,14 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
                                          sampleRate:engine_input_format.sampleRate
                                            channels:1
                                         interleaved:YES];
+
+    configured_recording_sample_rate_ = rtc_input_format.sampleRate;
+    configured_recording_channels_ = rtc_input_format.channelCount;
+    rollback_actions.push_back([this]() {
+      RTC_DCHECK_RUN_ON(thread_);
+      configured_recording_sample_rate_ = 0;
+      configured_recording_channels_ = 0;
+    });
 
     audio_device_buffer_->SetRecordingSampleRate(rtc_input_format.sampleRate);
     audio_device_buffer_->SetRecordingChannels(rtc_input_format.channelCount);
@@ -3255,6 +3284,8 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
     measured_record_delay_ms_.store(0, std::memory_order_relaxed);
     recording_callback_count_.store(0, std::memory_order_relaxed);
     last_recording_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+    configured_recording_sample_rate_ = 0;
+    configured_recording_channels_ = 0;
 
     // Dispose Float32 -> Int16 converter.
     if (converter_ref_ != nullptr) {
@@ -3629,6 +3660,10 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
     last_playout_callback_mach_ticks_.store(0, std::memory_order_relaxed);
     recording_callback_count_.store(0, std::memory_order_relaxed);
     last_recording_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+    configured_playout_sample_rate_ = 0;
+    configured_playout_channels_ = 0;
+    configured_recording_sample_rate_ = 0;
+    configured_recording_channels_ = 0;
 #if TARGET_OS_OSX
     if (!DestroyAggregateDeviceIfNeeded()) {
       LOGE() << "Failed to destroy aggregate while releasing engine";

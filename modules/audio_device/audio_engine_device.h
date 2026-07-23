@@ -141,6 +141,10 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
     uint64_t recording_callback_age_ms = 0;
     uint16_t measured_playout_delay_ms = 0;
     uint16_t measured_recording_delay_ms = 0;
+    double configured_playout_sample_rate = 0;
+    double configured_recording_sample_rate = 0;
+    uint32_t configured_playout_channels = 0;
+    uint32_t configured_recording_channels = 0;
   };
 
   // Represents the state of the audio engine, including input/output status,
@@ -610,6 +614,8 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
   std::atomic<uint16_t> measured_playout_delay_ms_{0};
   std::atomic<uint64_t> playout_callback_count_{0};
   std::atomic<uint64_t> last_playout_callback_mach_ticks_{0};
+  double configured_playout_sample_rate_ RTC_GUARDED_BY(thread_) = 0;
+  uint32_t configured_playout_channels_ RTC_GUARDED_BY(thread_) = 0;
 
   // Input related nodes
   AVAudioSinkNode* sink_node_ RTC_GUARDED_BY(thread_);
@@ -618,6 +624,8 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
   std::atomic<uint16_t> measured_record_delay_ms_{0};
   std::atomic<uint64_t> recording_callback_count_{0};
   std::atomic<uint64_t> last_recording_callback_mach_ticks_{0};
+  double configured_recording_sample_rate_ RTC_GUARDED_BY(thread_) = 0;
+  uint32_t configured_recording_channels_ RTC_GUARDED_BY(thread_) = 0;
 
   // Float32 -> Int16 converter.
   AudioConverterRef converter_ref_ = nullptr;
