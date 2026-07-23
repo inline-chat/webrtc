@@ -535,19 +535,34 @@ int32_t AudioEngineDevice::Terminate() {
   // input/output. Calling StopRecording alone is insufficient when persistent
   // input mode owns the microphone. Do not acknowledge termination unless the
   // engine, AudioDeviceBuffer, and private aggregate are all locally quiescent.
-  int32_t shutdown_result = ModifyEngineState([](EngineState state) {
-    state.input_enabled = false;
-    state.input_enabled_persistent_mode = false;
-    state.input_running = false;
-    state.output_enabled = false;
-    state.output_running = false;
-    return state;
-  });
+  int32_t shutdown_result = ModifyEngineState(
+      [](EngineState state) {
+        state.input_enabled = false;
+        state.input_enabled_persistent_mode = false;
+        state.input_running = false;
+        state.output_enabled = false;
+        state.output_running = false;
+        return state;
+      },
+      /*recover_previous_state_on_failure=*/false);
   if (shutdown_result != 0 || engine_device_ != nil ||
       engine_manual_input_ != nil || audio_device_buffer_->IsRecording() ||
       audio_device_buffer_->IsPlaying()) {
-    LOGE() << "Terminate did not reach local audio quiescence, error: "
+    LOGW() << "Terminate state transition required forced local quiescence, error: "
            << shutdown_result;
+    if (!ForceLocalAudioQuiescence()) {
+      LOGE() << "Terminate could not force local audio quiescence";
+      return kAudioEngineTerminateError;
+    }
+    engine_state_.input_enabled = false;
+    engine_state_.input_enabled_persistent_mode = false;
+    engine_state_.input_running = false;
+    engine_state_.output_enabled = false;
+    engine_state_.output_running = false;
+  }
+  if (engine_device_ != nil || engine_manual_input_ != nil ||
+      audio_device_buffer_->IsRecording() || audio_device_buffer_->IsPlaying()) {
+    LOGE() << "Terminate did not reach local audio quiescence";
     return kAudioEngineTerminateError;
   }
 
@@ -1760,8 +1775,120 @@ void AudioEngineDevice::EnsureFineAudioBuffer() {
   }
 }
 
+bool AudioEngineDevice::ForceLocalAudioQuiescence() {
+  RTC_DCHECK_RUN_ON(thread_);
+
+  if (configuration_observer_ != nullptr) {
+    NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+    [center removeObserver:(__bridge_transfer id)configuration_observer_
+                      name:AVAudioEngineConfigurationChangeNotification
+                    object:nil];
+    configuration_observer_ = nil;
+  }
+
+  AVAudioEngine* device_engine = engine_device_;
+  if (device_engine != nil) {
+    const bool was_running = device_engine.running;
+    [device_engine stop];
+
+    AVAudioInputNode* input_node = device_engine.inputNode;
+    AVAudioOutputNode* output_node = device_engine.outputNode;
+    if (input_node != nil && input_node.audioUnit != nullptr) {
+      OSStatus result = AudioOutputUnitStop(input_node.audioUnit);
+      if (result != noErr) {
+        LOGW() << "Forced input AudioUnit stop returned: " << result;
+      }
+    }
+    if (output_node != nil && output_node.audioUnit != nullptr) {
+      OSStatus result = AudioOutputUnitStop(output_node.audioUnit);
+      if (result != noErr) {
+        LOGW() << "Forced output AudioUnit stop returned: " << result;
+      }
+    }
+
+    if (observer_ != nullptr && was_running) {
+      int32_t result = observer_->OnEngineDidStop(device_engine, false, false);
+      if (result != 0) {
+        LOGW() << "Forced OnEngineDidStop returned: " << result;
+      }
+    }
+    if (observer_ != nullptr) {
+      int32_t result = observer_->OnEngineWillRelease(device_engine);
+      if (result != 0) {
+        LOGW() << "Forced OnEngineWillRelease returned: " << result;
+      }
+    }
+  }
+
+  AVAudioEngine* manual_engine = engine_manual_input_;
+  if (manual_engine != nil) {
+    const bool was_running = manual_engine.running;
+    [manual_engine stop];
+    if (observer_ != nullptr && was_running) {
+      int32_t result = observer_->OnEngineDidStop(manual_engine, false, false);
+      if (result != 0) {
+        LOGW() << "Forced manual OnEngineDidStop returned: " << result;
+      }
+    }
+    if (observer_ != nullptr) {
+      int32_t result = observer_->OnEngineWillRelease(manual_engine);
+      if (result != 0) {
+        LOGW() << "Forced manual OnEngineWillRelease returned: " << result;
+      }
+    }
+  }
+  if (render_thread_ != nullptr) {
+    render_thread_->Stop();
+    render_thread_ = nullptr;
+  }
+
+  if (audio_device_buffer_->IsPlaying()) {
+    audio_device_buffer_->StopPlayout();
+  }
+  if (audio_device_buffer_->IsRecording()) {
+    audio_device_buffer_->StopRecording();
+  }
+
+  source_node_ = nil;
+  sink_node_ = nil;
+  input_mixer_node_ = nil;
+  if (converter_ref_ != nullptr) {
+    OSStatus result = AudioConverterDispose(converter_ref_);
+    if (result != noErr) {
+      LOGW() << "Forced AudioConverter dispose returned: " << result;
+    }
+    converter_ref_ = nullptr;
+  }
+  converter_buffer_ = nil;
+  render_buffer_ = nil;
+  read_buffer_ = nil;
+  render_block_ = nullptr;
+  fine_audio_buffer_.reset();
+  engine_device_ = nil;
+  engine_manual_input_ = nil;
+
+  playout_hardware_delay_ms_.store(0, std::memory_order_relaxed);
+  measured_playout_delay_ms_.store(0, std::memory_order_relaxed);
+  record_hardware_delay_ms_.store(0, std::memory_order_relaxed);
+  measured_record_delay_ms_.store(0, std::memory_order_relaxed);
+  playout_callback_count_.store(0, std::memory_order_relaxed);
+  last_playout_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+  recording_callback_count_.store(0, std::memory_order_relaxed);
+  last_recording_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+
+#if TARGET_OS_OSX
+  const bool aggregate_destroyed = DestroyAggregateDeviceIfNeeded();
+#else
+  const bool aggregate_destroyed = true;
+#endif
+  return aggregate_destroyed && engine_device_ == nil &&
+      engine_manual_input_ == nil && !audio_device_buffer_->IsPlaying() &&
+      !audio_device_buffer_->IsRecording();
+}
+
 int32_t AudioEngineDevice::ModifyEngineState(
-    std::function<EngineState(EngineState)> state_transform) {
+    std::function<EngineState(EngineState)> state_transform,
+    bool recover_previous_state_on_failure) {
   RTC_DCHECK_RUN_ON(thread_);
 
   EngineState old_state = engine_state_;
@@ -1822,6 +1949,36 @@ int32_t AudioEngineDevice::ModifyEngineState(
     if (shutdown_result != 0) {
       LOGE() << "ModifyEngineState: Failed to update state in device mode, error: "
              << shutdown_result;
+
+      const int32_t transition_result = shutdown_result;
+      EngineState quiescent_state = old_state;
+      quiescent_state.input_enabled = false;
+      quiescent_state.input_enabled_persistent_mode = false;
+      quiescent_state.input_running = false;
+      quiescent_state.output_enabled = false;
+      quiescent_state.output_running = false;
+
+      if (!ForceLocalAudioQuiescence()) {
+        LOGE() << "ModifyEngineState: Failed transition could not be made locally quiescent";
+        engine_state_ = quiescent_state;
+        shutdown_result = kAudioEngineStateTransitionError;
+      } else if (recover_previous_state_on_failure && old_state.IsAnyEnabled()) {
+        LOGW() << "ModifyEngineState: Restoring previous device state after failed transition";
+        EngineStateUpdate recovery_state = {quiescent_state, old_state};
+        int32_t recovery_result = ApplyDeviceEngineState(recovery_state);
+        if (recovery_result != 0) {
+          LOGE() << "ModifyEngineState: Failed to restore previous device state, error: "
+                 << recovery_result;
+          ForceLocalAudioQuiescence();
+          engine_state_ = quiescent_state;
+          shutdown_result = kAudioEngineStateTransitionError;
+        } else {
+          shutdown_result = transition_result;
+        }
+      } else {
+        engine_state_ = quiescent_state;
+        shutdown_result = transition_result;
+      }
     }
   } else if (new_state.render_mode == RenderMode::Manual) {
     startup_result = ApplyManualEngineState(state);
@@ -3243,6 +3400,24 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       } else {
         LOGI() << "Using default output device";
       }
+    }
+  }
+#endif
+
+  // --------------------------------------------------------------------------------------------
+  // Step: Reset software audio processing for a new physical route
+  //
+  // FineAudioBuffer reset only clears the ADM's short packet assembly queues;
+  // it does not clear AEC3's render history, delay estimator, or adaptive
+  // filters. Route rebuilds run with both AudioDeviceBuffer directions stopped,
+  // so reset APM before either direction resumes on the new acoustic path.
+#if TARGET_OS_OSX
+  if (!state.next.voice_processing_enabled && state.next.IsAnyEnabled() &&
+      (!state.prev.IsAnyEnabled() || state.IsEngineRecreateRequired())) {
+    int32_t result = audio_device_buffer_->NotifyAudioRouteChanged();
+    if (result != 0) {
+      LOGE() << "Failed to reset audio processing for route change: " << result;
+      return rollback(kAudioEngineStateTransitionError);
     }
   }
 #endif

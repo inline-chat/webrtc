@@ -480,11 +480,20 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
       bool special_case = (prev.IsOutputEnabled() && next.IsOutputEnabled()) &&
                           (prev.IsInputEnabled() && !next.IsInputEnabled());
 
+      // Without voice processing, macOS input and output share one HAL I/O
+      // unit. Adding or removing a direction can change the required physical
+      // target between a single device and a private aggregate, so a graph-only
+      // restart cannot preserve a truthful route.
+      bool shared_io_topology = prev.IsAnyEnabled() && next.IsAnyEnabled() &&
+                                !next.voice_processing_enabled &&
+                                DidUpdateAudioGraph();
+
       // Toggling voice processing requires a full engine recreate to ensure
       // a clean audio hardware state.
       bool voice_processing = DidUpdateVoiceProcessingEnabled();
 
-      return device || default_device || special_case || voice_processing;
+      return device || default_device || special_case || shared_io_topology ||
+             voice_processing;
     }
 
     bool DidEnableManualRenderingMode() const {
@@ -498,10 +507,16 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
 
   EngineState engine_state_ RTC_GUARDED_BY(thread_);
 
-  int32_t ModifyEngineState(std::function<EngineState(EngineState)> state_transform);
+  int32_t ModifyEngineState(std::function<EngineState(EngineState)> state_transform,
+                            bool recover_previous_state_on_failure = true);
 
   int32_t ApplyDeviceEngineState(EngineStateUpdate state);
   int32_t ApplyManualEngineState(EngineStateUpdate state);
+
+  // Emergency ownership barrier used after a failed state transition. Stops
+  // callbacks and native engines, releases graph objects, and destroys the
+  // private aggregate before a rollback is attempted or shutdown succeeds.
+  bool ForceLocalAudioQuiescence();
 
   // Recreates `fine_audio_buffer_` if null: the enable steps that create it and
   // the buffer-start steps that use it have different conditions.
