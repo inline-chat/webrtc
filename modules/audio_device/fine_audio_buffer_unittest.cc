@@ -13,6 +13,8 @@
 #include <climits>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include "api/array_view.h"
 #include "modules/audio_device/mock_audio_device_buffer.h"
@@ -22,6 +24,7 @@
 
 using ::testing::_;
 using ::testing::AtLeast;
+using ::testing::Eq;
 using ::testing::InSequence;
 using ::testing::Return;
 
@@ -150,6 +153,94 @@ TEST(FineBufferTest, BufferLessThan10ms) {
 TEST(FineBufferTest, GreaterThan10ms) {
   const int kFrameSizeSamples = kSamplesPer10Ms + 50;
   RunFineBufferTest(kFrameSizeSamples);
+}
+
+TEST(FineBufferTest, PreservesOldestTimestampAcrossSub10msCallbacks) {
+  constexpr int kTimestampSampleRate = 48000;
+  constexpr size_t kFiveMsSamples = kTimestampSampleRate * 5 / 1000;
+  constexpr int64_t kFirstCaptureTimeNs = 1'000'000'000;
+
+  MockAudioDeviceBuffer audio_device_buffer(CreateTestEnvironment());
+  audio_device_buffer.SetRecordingSampleRate(kTimestampSampleRate);
+  audio_device_buffer.SetRecordingChannels(1);
+  FineAudioBuffer fine_buffer(&audio_device_buffer);
+  std::vector<int16_t> samples(kFiveMsSamples, 0);
+
+  EXPECT_CALL(audio_device_buffer,
+              SetRecordedBuffer(_, kTimestampSampleRate * 10 / 1000,
+                                Eq(std::make_optional(kFirstCaptureTimeNs))))
+      .WillOnce(Return(0));
+  EXPECT_CALL(audio_device_buffer, SetVQEData(0, 25));
+  EXPECT_CALL(audio_device_buffer, DeliverRecordedData())
+      .WillOnce(Return(0));
+
+  fine_buffer.DeliverRecordedData(samples, 20, kFirstCaptureTimeNs);
+  fine_buffer.DeliverRecordedData(samples, 20,
+                                  kFirstCaptureTimeNs + 5'000'000);
+}
+
+TEST(FineBufferTest, AdvancesTimestampAndDelayAcrossLargeCallback) {
+  constexpr int kTimestampSampleRate = 48000;
+  constexpr size_t kTwentyMsSamples = kTimestampSampleRate * 20 / 1000;
+  constexpr int64_t kFirstCaptureTimeNs = 2'000'000'000;
+
+  MockAudioDeviceBuffer audio_device_buffer(CreateTestEnvironment());
+  audio_device_buffer.SetRecordingSampleRate(kTimestampSampleRate);
+  audio_device_buffer.SetRecordingChannels(1);
+  FineAudioBuffer fine_buffer(&audio_device_buffer);
+  std::vector<int16_t> samples(kTwentyMsSamples, 0);
+
+  {
+    InSequence sequence;
+    EXPECT_CALL(audio_device_buffer,
+                SetRecordedBuffer(_, kTimestampSampleRate * 10 / 1000,
+                                  Eq(std::make_optional(kFirstCaptureTimeNs))))
+        .WillOnce(Return(0));
+    EXPECT_CALL(audio_device_buffer, SetVQEData(0, 20));
+    EXPECT_CALL(audio_device_buffer, DeliverRecordedData())
+        .WillOnce(Return(0));
+    EXPECT_CALL(
+        audio_device_buffer,
+        SetRecordedBuffer(_, kTimestampSampleRate * 10 / 1000,
+                          Eq(std::make_optional(kFirstCaptureTimeNs +
+                                                10'000'000))))
+        .WillOnce(Return(0));
+    EXPECT_CALL(audio_device_buffer, SetVQEData(0, 10));
+    EXPECT_CALL(audio_device_buffer, DeliverRecordedData())
+        .WillOnce(Return(0));
+  }
+
+  fine_buffer.DeliverRecordedData(samples, 20, kFirstCaptureTimeNs);
+}
+
+TEST(FineBufferTest, DiscardsPartialPacketAcrossTimestampDiscontinuity) {
+  constexpr int kTimestampSampleRate = 48000;
+  constexpr size_t kFiveMsSamples = kTimestampSampleRate * 5 / 1000;
+  constexpr int64_t kFirstCaptureTimeNs = 3'000'000'000;
+  constexpr int64_t kCaptureTimeAfterDiscontinuityNs =
+      kFirstCaptureTimeNs + 500'000'000;
+
+  MockAudioDeviceBuffer audio_device_buffer(CreateTestEnvironment());
+  audio_device_buffer.SetRecordingSampleRate(kTimestampSampleRate);
+  audio_device_buffer.SetRecordingChannels(1);
+  FineAudioBuffer fine_buffer(&audio_device_buffer);
+  std::vector<int16_t> samples(kFiveMsSamples, 0);
+
+  EXPECT_CALL(
+      audio_device_buffer,
+      SetRecordedBuffer(_, kTimestampSampleRate * 10 / 1000,
+                        Eq(std::make_optional(kCaptureTimeAfterDiscontinuityNs))))
+      .WillOnce(Return(0));
+  EXPECT_CALL(audio_device_buffer, SetVQEData(0, 25));
+  EXPECT_CALL(audio_device_buffer, DeliverRecordedData())
+      .WillOnce(Return(0));
+
+  fine_buffer.DeliverRecordedData(samples, 20, kFirstCaptureTimeNs);
+  fine_buffer.DeliverRecordedData(samples, 20,
+                                  kCaptureTimeAfterDiscontinuityNs);
+  fine_buffer.DeliverRecordedData(samples, 20,
+                                  kCaptureTimeAfterDiscontinuityNs +
+                                      5'000'000);
 }
 
 }  // namespace webrtc

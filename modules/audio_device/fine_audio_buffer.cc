@@ -10,8 +10,11 @@
 
 #include "modules/audio_device/fine_audio_buffer.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 
 #include "api/array_view.h"
@@ -21,6 +24,14 @@
 #include "rtc_base/numerics/safe_conversions.h"
 
 namespace webrtc {
+
+namespace {
+
+// A small callback-size change is normal, but samples separated by a route or
+// clock discontinuity must not be assembled into one 10 ms AEC packet.
+constexpr int64_t kMaxCaptureTimestampDiscontinuityNs = 100'000'000;
+
+}  // namespace
 
 FineAudioBuffer::FineAudioBuffer(AudioDeviceBuffer* audio_device_buffer)
     : audio_device_buffer_(audio_device_buffer),
@@ -54,6 +65,7 @@ void FineAudioBuffer::ResetPlayout() {
 
 void FineAudioBuffer::ResetRecord() {
   record_buffer_.Clear();
+  record_buffer_capture_time_ns_.reset();
 }
 
 bool FineAudioBuffer::IsReadyForPlayout() const {
@@ -112,6 +124,39 @@ void FineAudioBuffer::DeliverRecordedData(
     int record_delay_ms,
     std::optional<int64_t> capture_time_ns) {
   RTC_DCHECK(IsReadyForRecord());
+  size_t buffered_elements_before_append = record_buffer_.size();
+  if (buffered_elements_before_append > 0 && capture_time_ns.has_value() &&
+      record_buffer_capture_time_ns_.has_value()) {
+    const size_t buffered_frames =
+        buffered_elements_before_append / record_channels_;
+    const int64_t buffered_duration_ns = static_cast<int64_t>(
+        (1'000'000'000.0 * buffered_frames) /
+        audio_device_buffer_->RecordingSampleRate());
+    const int64_t expected_capture_time_ns =
+        *record_buffer_capture_time_ns_ + buffered_duration_ns;
+    const int64_t timestamp_delta_ns =
+        *capture_time_ns - expected_capture_time_ns;
+    if (timestamp_delta_ns > kMaxCaptureTimestampDiscontinuityNs ||
+        timestamp_delta_ns < -kMaxCaptureTimestampDiscontinuityNs) {
+      RTC_LOG(LS_WARNING)
+          << "Discarding partial capture packet after timestamp discontinuity";
+      record_buffer_.Clear();
+      record_buffer_capture_time_ns_ = capture_time_ns;
+      buffered_elements_before_append = 0;
+    }
+  }
+  if (buffered_elements_before_append == 0) {
+    record_buffer_capture_time_ns_ = capture_time_ns;
+  } else if (!record_buffer_capture_time_ns_.has_value() &&
+             capture_time_ns.has_value()) {
+    const size_t buffered_frames =
+        buffered_elements_before_append / record_channels_;
+    const int64_t buffered_duration_ns = static_cast<int64_t>(
+        (1'000'000'000.0 * buffered_frames) /
+        audio_device_buffer_->RecordingSampleRate());
+    record_buffer_capture_time_ns_ =
+        *capture_time_ns - buffered_duration_ns;
+  }
   // Always append new data and grow the buffer when needed.
   record_buffer_.AppendData(audio_buffer.data(), audio_buffer.size());
   // Consume samples from buffer in chunks of 10ms until there is not
@@ -120,14 +165,30 @@ void FineAudioBuffer::DeliverRecordedData(
   const size_t num_elements_10ms =
       record_channels_ * record_samples_per_channel_10ms_;
   while (record_buffer_.size() >= num_elements_10ms) {
+    double effective_record_delay_ms = record_delay_ms;
+    if (capture_time_ns.has_value() &&
+        record_buffer_capture_time_ns_.has_value()) {
+      effective_record_delay_ms +=
+          (*capture_time_ns - *record_buffer_capture_time_ns_) / 1'000'000.0;
+    }
+    const int bounded_record_delay_ms = static_cast<int>(std::clamp(
+        std::round(effective_record_delay_ms), 0.0,
+        static_cast<double>(std::numeric_limits<uint16_t>::max())));
     audio_device_buffer_->SetRecordedBuffer(record_buffer_.data(),
                                             record_samples_per_channel_10ms_,
-                                            capture_time_ns);
-    audio_device_buffer_->SetVQEData(playout_delay_ms_, record_delay_ms);
+                                            record_buffer_capture_time_ns_);
+    audio_device_buffer_->SetVQEData(playout_delay_ms_,
+                                     bounded_record_delay_ms);
     audio_device_buffer_->DeliverRecordedData();
     memmove(record_buffer_.data(), record_buffer_.data() + num_elements_10ms,
             (record_buffer_.size() - num_elements_10ms) * sizeof(int16_t));
     record_buffer_.SetSize(record_buffer_.size() - num_elements_10ms);
+    if (record_buffer_capture_time_ns_.has_value()) {
+      *record_buffer_capture_time_ns_ += 10'000'000;
+    }
+    if (record_buffer_.size() == 0) {
+      record_buffer_capture_time_ns_.reset();
+    }
   }
 }
 

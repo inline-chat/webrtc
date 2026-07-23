@@ -93,6 +93,10 @@ class FineAudioBuffer {
   // Storage for input samples that are about to be delivered to the WebRTC
   // ADB or remains from the last successful delivery of a 10ms audio buffer.
   BufferT<int16_t> record_buffer_;
+  // Host timestamp of the first frame currently cached in `record_buffer_`.
+  // Keeping it with the cache prevents sub-10ms device callbacks from tagging
+  // an older assembled packet with the newest callback's timestamp.
+  std::optional<int64_t> record_buffer_capture_time_ns_;
   // Contains latest delay estimate given to GetPlayoutData().
   int playout_delay_ms_ = 0;
 };

@@ -58,6 +58,23 @@ typedef struct {
   RTC_OBJC_TYPE(RTCAudioEngineMuteMode) muteMode;
 } RTC_OBJC_TYPE(RTCAudioEngineState);
 
+/** Realtime callback and delay readback for the current AudioEngine graph.
+ *
+ * Counts reset on every directional graph rebuild. A callback is physically
+ * healthy only when it has been seen and its age remains recent; ADM playing
+ * or recording state alone does not prove that hardware callbacks advance.
+ */
+typedef struct {
+  BOOL playoutCallbackSeen;
+  BOOL recordingCallbackSeen;
+  uint64_t playoutCallbackCount;
+  uint64_t recordingCallbackCount;
+  uint64_t playoutCallbackAgeMilliseconds;
+  uint64_t recordingCallbackAgeMilliseconds;
+  uint16_t measuredPlayoutDelayMilliseconds;
+  uint16_t measuredRecordingDelayMilliseconds;
+} RTC_OBJC_TYPE(RTCAudioEngineRuntimeDiagnostics);
+
 typedef struct {
   BOOL isInputAvailable;
   BOOL isOutputAvailable;
@@ -232,6 +249,9 @@ RTC_OBJC_EXPORT
 
 // Directly get & set engine state.
 @property(nonatomic, assign) RTC_OBJC_TYPE(RTCAudioEngineState) engineState;
+
+@property(nonatomic, readonly)
+    RTC_OBJC_TYPE(RTCAudioEngineRuntimeDiagnostics) audioEngineRuntimeDiagnostics;
 
 @property(nonatomic, readonly, getter=isRecordingAlwaysPreparedMode)
     BOOL recordingAlwaysPreparedMode;

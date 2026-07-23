@@ -17,7 +17,11 @@
 #include "audio_device_utils_mac.h"
 
 #include <IOKit/audio/IOAudioTypes.h>
+#include <unistd.h>
 
+#include <atomic>
+#include <cstdint>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -112,6 +116,175 @@ std::optional<uint32_t> GetDeviceUint32Property(
   if (result != noErr) return std::nullopt;
 
   return property_value;
+}
+
+template <typename CFType>
+CFType CopyAudioObjectCFProperty(
+    AudioObjectID object_id,
+    AudioObjectPropertySelector property_selector) {
+  AudioObjectPropertyAddress property_address = {
+      property_selector, kAudioObjectPropertyScopeGlobal,
+      kAudioObjectPropertyElementMain};
+  CFType property_value = nullptr;
+  UInt32 size = sizeof(property_value);
+  OSStatus result = AudioObjectGetPropertyData(
+      object_id, &property_address, 0 /* inQualifierDataSize */,
+      nullptr /* inQualifierData */, &size, &property_value);
+  if (result != noErr) {
+    return nullptr;
+  }
+  return property_value;
+}
+
+std::optional<std::vector<std::string>> GetAggregateSubDeviceUIDs(
+    AudioObjectID aggregate_device_id) {
+  CFArrayRef sub_device_uids = CopyAudioObjectCFProperty<CFArrayRef>(
+      aggregate_device_id, kAudioAggregateDevicePropertyFullSubDeviceList);
+  if (sub_device_uids == nullptr) {
+    return std::nullopt;
+  }
+
+  std::vector<std::string> result;
+  if (CFGetTypeID(sub_device_uids) == CFArrayGetTypeID()) {
+    CFIndex count = CFArrayGetCount(sub_device_uids);
+    result.reserve(count);
+    for (CFIndex index = 0; index < count; ++index) {
+      CFTypeRef value = CFArrayGetValueAtIndex(sub_device_uids, index);
+      if (value == nullptr || CFGetTypeID(value) != CFStringGetTypeID()) {
+        result.clear();
+        break;
+      }
+      result.push_back(CFStringRefToUTF8(static_cast<CFStringRef>(value)));
+    }
+  }
+  CFRelease(sub_device_uids);
+  if (result.empty()) {
+    return std::nullopt;
+  }
+  return result;
+}
+
+std::optional<std::string> GetAggregateMainSubDeviceUID(
+    AudioObjectID aggregate_device_id) {
+  CFStringRef main_uid = CopyAudioObjectCFProperty<CFStringRef>(
+      aggregate_device_id, kAudioAggregateDevicePropertyMainSubDevice);
+  if (main_uid == nullptr || CFGetTypeID(main_uid) != CFStringGetTypeID()) {
+    if (main_uid != nullptr) {
+      CFRelease(main_uid);
+    }
+    return std::nullopt;
+  }
+  std::string result = CFStringRefToUTF8(main_uid);
+  CFRelease(main_uid);
+  return result;
+}
+
+std::optional<std::vector<AudioObjectID>> GetAggregateActiveSubDeviceIDs(
+    AudioObjectID aggregate_device_id) {
+  AudioObjectPropertyAddress property_address = {
+      kAudioAggregateDevicePropertyActiveSubDeviceList,
+      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+  UInt32 size = 0;
+  OSStatus result = AudioObjectGetPropertyDataSize(
+      aggregate_device_id, &property_address, 0 /* inQualifierDataSize */,
+      nullptr /* inQualifierData */, &size);
+  if (result != noErr || size == 0 || size % sizeof(AudioObjectID) != 0) {
+    return std::nullopt;
+  }
+
+  std::vector<AudioObjectID> sub_devices(size / sizeof(AudioObjectID));
+  result = AudioObjectGetPropertyData(
+      aggregate_device_id, &property_address, 0 /* inQualifierDataSize */,
+      nullptr /* inQualifierData */, &size, sub_devices.data());
+  if (result != noErr) {
+    return std::nullopt;
+  }
+  return sub_devices;
+}
+
+bool AggregateCompositionMatches(AudioObjectID aggregate_device_id,
+                                 const std::string& output_uid,
+                                 const std::string& input_uid) {
+  CFDictionaryRef composition = CopyAudioObjectCFProperty<CFDictionaryRef>(
+      aggregate_device_id, kAudioAggregateDevicePropertyComposition);
+  if (composition == nullptr ||
+      CFGetTypeID(composition) != CFDictionaryGetTypeID()) {
+    if (composition != nullptr) {
+      CFRelease(composition);
+    }
+    return false;
+  }
+
+  CFTypeRef sub_devices_value = CFDictionaryGetValue(
+      composition, CFSTR(kAudioAggregateDeviceSubDeviceListKey));
+  CFTypeRef main_value = CFDictionaryGetValue(
+      composition, CFSTR(kAudioAggregateDeviceMainSubDeviceKey));
+  CFTypeRef private_value = CFDictionaryGetValue(
+      composition, CFSTR(kAudioAggregateDeviceIsPrivateKey));
+  bool matches = sub_devices_value != nullptr &&
+                 CFGetTypeID(sub_devices_value) == CFArrayGetTypeID() &&
+                 main_value != nullptr &&
+                 CFGetTypeID(main_value) == CFStringGetTypeID() &&
+                 private_value != nullptr &&
+                 CFGetTypeID(private_value) == CFNumberGetTypeID();
+
+  int32_t is_private = 0;
+  if (matches) {
+    matches = CFNumberGetValue(static_cast<CFNumberRef>(private_value),
+                               kCFNumberSInt32Type, &is_private) &&
+              is_private != 0 &&
+              CFStringRefToUTF8(static_cast<CFStringRef>(main_value)) ==
+                  output_uid;
+  }
+
+  if (matches) {
+    CFArrayRef sub_devices = static_cast<CFArrayRef>(sub_devices_value);
+    matches = CFArrayGetCount(sub_devices) == 2;
+    for (CFIndex index = 0; matches && index < 2; ++index) {
+      CFTypeRef entry_value = CFArrayGetValueAtIndex(sub_devices, index);
+      if (entry_value == nullptr ||
+          CFGetTypeID(entry_value) != CFDictionaryGetTypeID()) {
+        matches = false;
+        break;
+      }
+      CFDictionaryRef entry = static_cast<CFDictionaryRef>(entry_value);
+      CFTypeRef uid_value =
+          CFDictionaryGetValue(entry, CFSTR(kAudioSubDeviceUIDKey));
+      const std::string& expected_uid = index == 0 ? output_uid : input_uid;
+      if (uid_value == nullptr ||
+          CFGetTypeID(uid_value) != CFStringGetTypeID() ||
+          CFStringRefToUTF8(static_cast<CFStringRef>(uid_value)) !=
+              expected_uid) {
+        matches = false;
+        break;
+      }
+      if (index == 1) {
+        CFTypeRef drift_value = CFDictionaryGetValue(
+            entry, CFSTR(kAudioSubDeviceDriftCompensationKey));
+        int32_t drift_compensation = 0;
+        matches = drift_value != nullptr &&
+                  CFGetTypeID(drift_value) == CFNumberGetTypeID() &&
+                  CFNumberGetValue(static_cast<CFNumberRef>(drift_value),
+                                   kCFNumberSInt32Type,
+                                   &drift_compensation) &&
+                  drift_compensation != 0;
+      }
+    }
+  }
+
+  CFRelease(composition);
+  return matches;
+}
+
+bool AudioObjectExists(AudioObjectID object_id) {
+  AudioObjectPropertyAddress property_address = {
+      kAudioObjectPropertyClass, kAudioObjectPropertyScopeGlobal,
+      kAudioObjectPropertyElementMain};
+  AudioClassID object_class = 0;
+  UInt32 size = sizeof(object_class);
+  return AudioObjectGetPropertyData(
+             object_id, &property_address, 0 /* inQualifierDataSize */,
+             nullptr /* inQualifierData */, &size, &object_class) == noErr;
 }
 
 uint32_t GetDevicePropertySize(AudioObjectID device_id,
@@ -270,6 +443,34 @@ uint32_t GetNumStreams(AudioObjectID device_id, bool is_input) {
                                InputOutputScope(is_input));
 }
 
+uint32_t GetNumChannels(AudioObjectID device_id, bool is_input) {
+  AudioObjectPropertyAddress property_address = {
+      kAudioDevicePropertyStreamConfiguration, InputOutputScope(is_input),
+      kAudioObjectPropertyElementMain};
+  UInt32 size = 0;
+  OSStatus result = AudioObjectGetPropertyDataSize(
+      device_id, &property_address, 0 /* inQualifierDataSize */,
+      nullptr /* inQualifierData */, &size);
+  if (result != noErr || size < sizeof(AudioBufferList)) {
+    return 0;
+  }
+
+  std::vector<uint8_t> storage(size);
+  auto* buffer_list = reinterpret_cast<AudioBufferList*>(storage.data());
+  result = AudioObjectGetPropertyData(
+      device_id, &property_address, 0 /* inQualifierDataSize */,
+      nullptr /* inQualifierData */, &size, buffer_list);
+  if (result != noErr) {
+    return 0;
+  }
+
+  uint32_t channel_count = 0;
+  for (UInt32 index = 0; index < buffer_list->mNumberBuffers; ++index) {
+    channel_count += buffer_list->mBuffers[index].mNumberChannels;
+  }
+  return channel_count;
+}
+
 std::optional<uint32_t> GetDeviceSource(AudioObjectID device_id,
                                         bool is_input) {
   return GetDeviceUint32Property(device_id, kAudioDevicePropertyDataSource,
@@ -379,6 +580,184 @@ bool IsOutputDevice(AudioObjectID device_id) {
 
   return num_valid_output_streams > 0 ||
          (num_unknown_output_streams > 0 && num_input_streams == 0);
+}
+
+std::optional<AudioObjectID> CreatePrivateAggregateDevice(
+    AudioObjectID output_device_id, AudioObjectID input_device_id) {
+  std::optional<std::string> output_uid = GetDeviceUniqueID(output_device_id);
+  std::optional<std::string> input_uid = GetDeviceUniqueID(input_device_id);
+  if (!output_uid.has_value() || !input_uid.has_value()) {
+    RTC_LOG(LS_ERROR) << "CreatePrivateAggregateDevice: missing device UID"
+                      << " (output=" << output_device_id
+                      << ", input=" << input_device_id << ")";
+    return std::nullopt;
+  }
+
+  // The aggregate UID must be unique. Multiple instances may exist briefly
+  // during engine recreation, so include a counter.
+  static std::atomic<uint64_t> counter{0};
+  const std::string aggregate_uid = "org.webrtc.audioengine.aggregate." +
+                                    std::to_string(getpid()) + "." +
+                                    std::to_string(counter.fetch_add(1));
+
+  CFStringRef aggregate_uid_cf = CFStringCreateWithCString(
+      kCFAllocatorDefault, aggregate_uid.c_str(), kNarrowStringEncoding);
+  CFStringRef output_uid_cf = CFStringCreateWithCString(
+      kCFAllocatorDefault, output_uid->c_str(), kNarrowStringEncoding);
+  CFStringRef input_uid_cf = CFStringCreateWithCString(
+      kCFAllocatorDefault, input_uid->c_str(), kNarrowStringEncoding);
+
+  CFMutableDictionaryRef output_sub_device = CFDictionaryCreateMutable(
+      kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+      &kCFTypeDictionaryValueCallBacks);
+  CFDictionarySetValue(output_sub_device, CFSTR(kAudioSubDeviceUIDKey),
+                       output_uid_cf);
+
+  // The output device drives the clock, so the input sub device needs drift
+  // compensation.
+  int32_t drift_compensation = 1;
+  CFNumberRef drift_compensation_cf = CFNumberCreate(
+      kCFAllocatorDefault, kCFNumberSInt32Type, &drift_compensation);
+  CFMutableDictionaryRef input_sub_device = CFDictionaryCreateMutable(
+      kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+      &kCFTypeDictionaryValueCallBacks);
+  CFDictionarySetValue(input_sub_device, CFSTR(kAudioSubDeviceUIDKey),
+                       input_uid_cf);
+  CFDictionarySetValue(input_sub_device,
+                       CFSTR(kAudioSubDeviceDriftCompensationKey),
+                       drift_compensation_cf);
+
+  const void* sub_devices[] = {output_sub_device, input_sub_device};
+  CFArrayRef sub_device_list =
+      CFArrayCreate(kCFAllocatorDefault, sub_devices, 2, &kCFTypeArrayCallBacks);
+
+  int32_t is_private = 1;
+  CFNumberRef is_private_cf =
+      CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &is_private);
+
+  CFMutableDictionaryRef description = CFDictionaryCreateMutable(
+      kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+      &kCFTypeDictionaryValueCallBacks);
+  CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceUIDKey),
+                       aggregate_uid_cf);
+  CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceNameKey),
+                       CFSTR("WebRTC AudioEngine I/O"));
+  CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceSubDeviceListKey),
+                       sub_device_list);
+  CFDictionarySetValue(description,
+                       CFSTR(kAudioAggregateDeviceMainSubDeviceKey),
+                       output_uid_cf);
+  CFDictionarySetValue(description, CFSTR(kAudioAggregateDeviceIsPrivateKey),
+                       is_private_cf);
+
+  AudioObjectID aggregate_device_id = kAudioObjectUnknown;
+  OSStatus status =
+      AudioHardwareCreateAggregateDevice(description, &aggregate_device_id);
+
+  CFRelease(description);
+  CFRelease(is_private_cf);
+  CFRelease(sub_device_list);
+  CFRelease(input_sub_device);
+  CFRelease(drift_compensation_cf);
+  CFRelease(output_sub_device);
+  CFRelease(input_uid_cf);
+  CFRelease(output_uid_cf);
+  CFRelease(aggregate_uid_cf);
+
+  if (status != noErr || aggregate_device_id == kAudioObjectUnknown) {
+    RTC_LOG(LS_ERROR) << "AudioHardwareCreateAggregateDevice failed: "
+                      << status;
+    return std::nullopt;
+  }
+
+  // Aggregate composition is asynchronous. Do not hand the object to the
+  // engine until its child ordering, clock, drift policy, and both stream
+  // directions are visible through HAL readback.
+  constexpr int kMaxReadinessAttempts = 200;
+  constexpr int64_t kReadinessPollIntervalMs = 10;
+  for (int attempt = 0; attempt < kMaxReadinessAttempts; ++attempt) {
+    if (VerifyPrivateAggregateDevice(aggregate_device_id, output_device_id,
+                                     input_device_id)) {
+      RTC_LOG(LS_INFO) << "Created verified private aggregate device "
+                       << aggregate_device_id;
+      return aggregate_device_id;
+    }
+    webrtc::Thread::SleepMs(kReadinessPollIntervalMs);
+  }
+
+  RTC_LOG(LS_ERROR) << "Private aggregate device did not become ready: "
+                    << aggregate_device_id;
+  if (!DestroyAggregateDevice(aggregate_device_id)) {
+    RTC_LOG(LS_ERROR) << "Failed to retire unready private aggregate device: "
+                      << aggregate_device_id;
+  }
+  return std::nullopt;
+}
+
+bool VerifyPrivateAggregateDevice(AudioObjectID aggregate_device_id,
+                                  AudioObjectID output_device_id,
+                                  AudioObjectID input_device_id) {
+  std::optional<std::string> output_uid = GetDeviceUniqueID(output_device_id);
+  std::optional<std::string> input_uid = GetDeviceUniqueID(input_device_id);
+  std::optional<std::vector<std::string>> sub_device_uids =
+      GetAggregateSubDeviceUIDs(aggregate_device_id);
+  std::optional<std::string> main_uid =
+      GetAggregateMainSubDeviceUID(aggregate_device_id);
+  std::optional<std::vector<AudioObjectID>> active_sub_devices =
+      GetAggregateActiveSubDeviceIDs(aggregate_device_id);
+
+  if (!output_uid || !input_uid || !sub_device_uids || !main_uid ||
+      !active_sub_devices || sub_device_uids->size() != 2 ||
+      active_sub_devices->size() != 2 || (*sub_device_uids)[0] != *output_uid ||
+      (*sub_device_uids)[1] != *input_uid || *main_uid != *output_uid) {
+    return false;
+  }
+
+  // The active list is ordered the same way as the full list. Validate both
+  // IDs as well as UIDs so drift compensation and channel offsets cannot be
+  // applied to a stale or substituted subdevice.
+  if ((*active_sub_devices)[0] != output_device_id ||
+      (*active_sub_devices)[1] != input_device_id) {
+    return false;
+  }
+
+  const uint32_t expected_input_channels =
+      GetNumChannels(output_device_id, true) +
+      GetNumChannels(input_device_id, true);
+  const uint32_t expected_output_channels =
+      GetNumChannels(output_device_id, false) +
+      GetNumChannels(input_device_id, false);
+  return AggregateCompositionMatches(aggregate_device_id, *output_uid,
+                                     *input_uid) &&
+         expected_input_channels > 0 && expected_output_channels > 0 &&
+         GetNumChannels(aggregate_device_id, true) == expected_input_channels &&
+         GetNumChannels(aggregate_device_id, false) == expected_output_channels;
+}
+
+bool DestroyAggregateDevice(AudioObjectID aggregate_device_id) {
+  if (aggregate_device_id == kAudioObjectUnknown ||
+      !AudioObjectExists(aggregate_device_id)) {
+    return true;
+  }
+
+  OSStatus status = AudioHardwareDestroyAggregateDevice(aggregate_device_id);
+  if (status != noErr) {
+    RTC_LOG(LS_WARNING) << "AudioHardwareDestroyAggregateDevice failed: "
+                        << status;
+    return false;
+  }
+
+  constexpr int kMaxDestructionAttempts = 200;
+  constexpr int64_t kDestructionPollIntervalMs = 10;
+  for (int attempt = 0; attempt < kMaxDestructionAttempts; ++attempt) {
+    if (!AudioObjectExists(aggregate_device_id)) {
+      return true;
+    }
+    webrtc::Thread::SleepMs(kDestructionPollIntervalMs);
+  }
+  RTC_LOG(LS_WARNING) << "Aggregate device destruction did not settle: "
+                      << aggregate_device_id;
+  return false;
 }
 
 }  // namespace mac_audio_utils

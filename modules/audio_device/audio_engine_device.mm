@@ -20,8 +20,11 @@
 #include "audio_engine_device.h"
 
 #include <mach/mach_time.h>
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
+#include <vector>
 
 #include "api/array_view.h"
 #include "api/audio/audio_processing_options_resolver.h"
@@ -53,8 +56,6 @@ NSString* const kAudioEngineInputMixerNodeKey = @"_audio_engine_input_mixer_node
 #define LOGE() RTC_LOG(LS_ERROR) << "AudioEngineDevice::"
 #define LOGW() RTC_LOG(LS_WARNING) << "AudioEngineDevice::"
 
-const UInt16 kFixedPlayoutDelayEstimate = 0;
-const UInt16 kFixedRecordDelayEstimate = 0;
 const UInt16 kStartEngineMaxRetries = 10;  // Maximum blocking 1sec.
 const useconds_t kStartEngineRetryDelayMs = 100;
 
@@ -62,6 +63,92 @@ const size_t kMaximumFramesPerBuffer = 3072;
 const size_t kAudioSampleSize = 2;  // Signed 16-bit integer
 
 namespace {
+
+uint16_t SaturatingDelayMs(double delay_ms) {
+  if (!std::isfinite(delay_ms) || delay_ms <= 0) {
+    return 0;
+  }
+  return static_cast<uint16_t>(std::min(
+      std::round(delay_ms),
+      static_cast<double>(std::numeric_limits<uint16_t>::max())));
+}
+
+uint16_t CallbackDelayMs(const AudioTimeStamp* timestamp,
+                         double mach_tick_units_to_nanoseconds,
+                         bool is_playout,
+                         uint16_t hardware_delay_ms) {
+  double scheduling_delay_ms = 0;
+  if (timestamp != nullptr &&
+      (timestamp->mFlags & kAudioTimeStampHostTimeValid) != 0) {
+    const uint64_t now = mach_absolute_time();
+    const double delta_ns =
+        is_playout
+            ? static_cast<double>(timestamp->mHostTime > now
+                                      ? timestamp->mHostTime - now
+                                      : 0) *
+                  mach_tick_units_to_nanoseconds
+            : static_cast<double>(now > timestamp->mHostTime
+                                      ? now - timestamp->mHostTime
+                                      : 0) *
+                  mach_tick_units_to_nanoseconds;
+    scheduling_delay_ms = delta_ns / 1'000'000.0;
+  }
+  return SaturatingDelayMs(scheduling_delay_ms + hardware_delay_ms);
+}
+
+uint64_t CallbackAgeMs(uint64_t last_callback_mach_ticks,
+                       double mach_tick_units_to_nanoseconds) {
+  if (last_callback_mach_ticks == 0) {
+    return 0;
+  }
+  const uint64_t now = mach_absolute_time();
+  if (now <= last_callback_mach_ticks) {
+    return 0;
+  }
+  const double age_ms =
+      static_cast<double>(now - last_callback_mach_ticks) *
+      mach_tick_units_to_nanoseconds / 1'000'000.0;
+  if (!std::isfinite(age_ms) || age_ms <= 0) {
+    return 0;
+  }
+  return static_cast<uint64_t>(std::min(
+      age_ms, static_cast<double>(std::numeric_limits<uint64_t>::max())));
+}
+
+#if TARGET_OS_OSX
+bool VerifyAudioUnitChannelMap(AudioUnit audio_unit,
+                               AudioUnitScope scope,
+                               AudioUnitElement element,
+                               const std::vector<SInt32>& expected_map) {
+  if (audio_unit == nullptr || expected_map.empty()) {
+    return false;
+  }
+  std::vector<SInt32> effective_map(expected_map.size(), -1);
+  UInt32 size = static_cast<UInt32>(effective_map.size() * sizeof(SInt32));
+  OSStatus status = AudioUnitGetProperty(
+      audio_unit, kAudioOutputUnitProperty_ChannelMap, scope, element,
+      effective_map.data(), &size);
+  return status == noErr && size == expected_map.size() * sizeof(SInt32) &&
+         effective_map == expected_map;
+}
+
+bool SetAndVerifyAudioUnitChannelMap(
+    AudioUnit audio_unit,
+    AudioUnitScope scope,
+    AudioUnitElement element,
+    const std::vector<SInt32>& expected_map) {
+  if (audio_unit == nullptr || expected_map.empty()) {
+    return false;
+  }
+  const UInt32 size =
+      static_cast<UInt32>(expected_map.size() * sizeof(SInt32));
+  OSStatus status = AudioUnitSetProperty(
+      audio_unit, kAudioOutputUnitProperty_ChannelMap, scope, element,
+      expected_map.data(), size);
+  return status == noErr &&
+         VerifyAudioUnitChannelMap(audio_unit, scope, element, expected_map);
+}
+#endif
 
 // Whether the coupled Apple VPIO path is currently active for `state`. Shared by
 // the validation context and the platform-path resolver below so the two cannot
@@ -392,6 +479,7 @@ int32_t AudioEngineDevice::Init() {
     LOGE() << "AudioObjectAddPropertyListener failed with error: " << err;
     return kAudioEngineInitError;
   }
+  devices_listener_registered_ = true;
 
   // Listen for default output device change.
   propertyAddress.mSelector = kAudioHardwarePropertyDefaultOutputDevice;
@@ -399,8 +487,12 @@ int32_t AudioEngineDevice::Init() {
                                        &objectListenerProc, this);
   if (err != noErr) {
     LOGE() << "AudioObjectAddPropertyListener failed with error: " << err;
+    if (!RemoveAudioDeviceListeners()) {
+      LOGE() << "Failed to roll back audio listeners after init failure";
+    }
     return kAudioEngineInitError;
   }
+  default_output_listener_registered_ = true;
 
   // Listen for default input device change.
   propertyAddress.mSelector = kAudioHardwarePropertyDefaultInputDevice;
@@ -408,8 +500,12 @@ int32_t AudioEngineDevice::Init() {
                                        &objectListenerProc, this);
   if (err != noErr) {
     LOGE() << "AudioObjectAddPropertyListener failed with error: " << err;
+    if (!RemoveAudioDeviceListeners()) {
+      LOGE() << "Failed to roll back audio listeners after init failure";
+    }
     return kAudioEngineInitError;
   }
+  default_input_listener_registered_ = true;
 
   UpdateAllDeviceIDs();
 #endif
@@ -422,44 +518,49 @@ int32_t AudioEngineDevice::Terminate() {
   LOGI() << "Terminate";
   RTC_DCHECK_RUN_ON(thread_);
   if (!initialized_) {
+#if TARGET_OS_OSX
+    // Init can fail after registering only a subset of listeners. Retire any
+    // partial native ownership even though the public initialized bit was
+    // never committed.
+    const bool aggregate_destroyed = DestroyAggregateDeviceIfNeeded();
+    const bool listeners_removed = RemoveAudioDeviceListeners();
+    if (!aggregate_destroyed || !listeners_removed) {
+      return kAudioEngineTerminateError;
+    }
+#endif
     return 0;
   }
 
+  // One terminal transaction disables persistent capture as well as ordinary
+  // input/output. Calling StopRecording alone is insufficient when persistent
+  // input mode owns the microphone. Do not acknowledge termination unless the
+  // engine, AudioDeviceBuffer, and private aggregate are all locally quiescent.
+  int32_t shutdown_result = ModifyEngineState([](EngineState state) {
+    state.input_enabled = false;
+    state.input_enabled_persistent_mode = false;
+    state.input_running = false;
+    state.output_enabled = false;
+    state.output_running = false;
+    return state;
+  });
+  if (shutdown_result != 0 || engine_device_ != nil ||
+      engine_manual_input_ != nil || audio_device_buffer_->IsRecording() ||
+      audio_device_buffer_->IsPlaying()) {
+    LOGE() << "Terminate did not reach local audio quiescence, error: "
+           << shutdown_result;
+    return kAudioEngineTerminateError;
+  }
+
 #if TARGET_OS_OSX
-  // Remove listeners for global scope.
-  AudioObjectPropertyAddress propertyAddress = {
-      kAudioHardwarePropertyDevices,    // selector
-      kAudioObjectPropertyScopeGlobal,  // scope
-      kAudioObjectPropertyElementMain   // element
-  };
-
-  OSStatus err = noErr;
-  err = AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &propertyAddress,
-                                          &objectListenerProc, this);
-  if (err != noErr) {
-    LOGE() << "AudioObjectRemovePropertyListener failed with error: " << err;
+  if (!DestroyAggregateDeviceIfNeeded()) {
+    LOGE() << "Terminate could not verify aggregate destruction";
     return kAudioEngineTerminateError;
   }
-
-  propertyAddress.mSelector = kAudioHardwarePropertyDefaultOutputDevice;
-  err = AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &propertyAddress,
-                                          &objectListenerProc, this);
-  if (err != noErr) {
-    LOGE() << "AudioObjectRemovePropertyListener failed with error: " << err;
-    return kAudioEngineTerminateError;
-  }
-
-  propertyAddress.mSelector = kAudioHardwarePropertyDefaultInputDevice;
-  err = AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &propertyAddress,
-                                          &objectListenerProc, this);
-  if (err != noErr) {
-    LOGE() << "AudioObjectRemovePropertyListener failed with error: " << err;
+  if (!RemoveAudioDeviceListeners()) {
+    LOGE() << "Terminate could not remove every audio-device listener";
     return kAudioEngineTerminateError;
   }
 #endif
-
-  StopPlayout();
-  StopRecording();
 
   initialized_ = false;
   return 0;
@@ -1258,12 +1359,11 @@ int AudioEngineDevice::GetRecordAudioParameters(AudioParameters* params) const {
 #endif
 
 int32_t AudioEngineDevice::PlayoutDelay(uint16_t* delayMS) const {
-  // LOGI() << "PlayoutDelay";
   if (delayMS == nullptr) {
     return -1;
   }
 
-  *delayMS = kFixedPlayoutDelayEstimate;
+  *delayMS = measured_playout_delay_ms_.load(std::memory_order_relaxed);
 
   return 0;
 }
@@ -1292,6 +1392,30 @@ int32_t AudioEngineDevice::GetEngineState(EngineState* state) {
   *state = engine_state_;
 
   return 0;
+}
+
+AudioEngineDevice::RuntimeDiagnostics
+AudioEngineDevice::GetRuntimeDiagnostics() const {
+  const uint64_t last_playout =
+      last_playout_callback_mach_ticks_.load(std::memory_order_relaxed);
+  const uint64_t last_recording =
+      last_recording_callback_mach_ticks_.load(std::memory_order_relaxed);
+  RuntimeDiagnostics diagnostics;
+  diagnostics.playout_callback_seen = last_playout != 0;
+  diagnostics.recording_callback_seen = last_recording != 0;
+  diagnostics.playout_callback_count =
+      playout_callback_count_.load(std::memory_order_relaxed);
+  diagnostics.recording_callback_count =
+      recording_callback_count_.load(std::memory_order_relaxed);
+  diagnostics.playout_callback_age_ms =
+      CallbackAgeMs(last_playout, machTickUnitsToNanoseconds_);
+  diagnostics.recording_callback_age_ms =
+      CallbackAgeMs(last_recording, machTickUnitsToNanoseconds_);
+  diagnostics.measured_playout_delay_ms =
+      measured_playout_delay_ms_.load(std::memory_order_relaxed);
+  diagnostics.measured_recording_delay_ms =
+      measured_record_delay_ms_.load(std::memory_order_relaxed);
+  return diagnostics;
 }
 
 int32_t AudioEngineDevice::SetObserver(AudioDeviceObserver* observer) {
@@ -1366,6 +1490,12 @@ int32_t AudioEngineDevice::SetVoiceProcessingBypassed(bool enable) {
   LOGI() << "SetVoiceProcessingBypassed: " << enable;
 
   int32_t result = ModifyEngineState([enable](EngineState state) -> EngineState {
+    if (!state.platform_voice_processing_allowed) {
+      // The process-wide policy is authoritative. A later SDK convenience
+      // setter must not recreate stale Apple component intent after VPIO was
+      // explicitly forbidden.
+      return SetVoiceProcessingPathEnabled(state, false);
+    }
     state.voice_processing_bypassed = enable;
     state.built_in_aec_enabled = !enable;
     state.built_in_ns_enabled = !enable;
@@ -1394,7 +1524,9 @@ int32_t AudioEngineDevice::SetVoiceProcessingAGCEnabled(bool enable) {
   LOGI() << "SetVoiceProcessingAGCEnabled: " << enable;
 
   int32_t result = ModifyEngineState([enable](EngineState state) -> EngineState {
-    state.voice_processing_agc_enabled = enable;
+    state.voice_processing_agc_enabled =
+        state.platform_voice_processing_allowed &&
+        state.voice_processing_enabled && enable;
     return state;
   });
 
@@ -2117,6 +2249,13 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
                                   state.prev.voice_processing_enabled;
 
   std::vector<std::function<void()>> rollback_actions;
+#if TARGET_OS_OSX
+  // A private aggregate flattens every direction from both subdevices. These
+  // maps restrict the shared HAL unit to the selected physical output and
+  // input, including when either endpoint is duplex.
+  std::vector<SInt32> aggregate_output_channel_map;
+  std::vector<SInt32> aggregate_input_channel_map;
+#endif
 
   auto rollback = [&](int32_t result) {
     // Execute rollback actions in reverse order (LIFO)
@@ -2233,6 +2372,12 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
     }
 
     engine_device_ = nil;
+#if TARGET_OS_OSX
+    if (!DestroyAggregateDeviceIfNeeded()) {
+      LOGE() << "Failed to destroy aggregate while recreating engine";
+      return rollback(kAudioEngineStateTransitionError);
+    }
+#endif
   }
 
   // --------------------------------------------------------------------------------------------
@@ -2369,12 +2514,172 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   }
 
   // --------------------------------------------------------------------------------------------
+  // Step: Configure device for the shared I/O unit (macOS, voice processing disabled)
+  //
+  // Without voice processing the engine's input and output nodes share a single
+  // HAL I/O unit, so per-direction device selection is impossible: setting
+  // kAudioOutputUnitProperty_CurrentDevice re-routes both directions. When the
+  // requested input and output devices differ, a private aggregate device
+  // combining them is created and set instead. This must happen before the
+  // enable steps below: the HAL unit rejects device changes once the graph is
+  // wired, and the node formats read during enable must reflect the device.
+#if TARGET_OS_OSX
+  if (!state.next.voice_processing_enabled && state.next.IsAnyEnabled() &&
+      (!state.prev.IsAnyEnabled() || state.IsEngineRecreateRequired())) {
+    bool input_needed = state.next.IsInputEnabled();
+    bool output_needed = state.next.IsOutputEnabled();
+    AudioObjectID requested_input = state.next.input_device_id;
+    AudioObjectID requested_output = state.next.output_device_id;
+
+    // Resolve default intent into physical devices for every transaction. The
+    // shared I/O unit cannot independently follow two different defaults, and
+    // default-device generation changes already force a full engine recreate.
+    AudioObjectID input_device = requested_input;
+    if (input_needed && input_device == kAudioObjectUnknown) {
+      input_device =
+          mac_audio_utils::GetDefaultInputDeviceID().value_or(kAudioObjectUnknown);
+    }
+    AudioObjectID output_device = requested_output;
+    if (output_needed && output_device == kAudioObjectUnknown) {
+      output_device =
+          mac_audio_utils::GetDefaultOutputDeviceID().value_or(kAudioObjectUnknown);
+    }
+    if ((input_needed && input_device == kAudioObjectUnknown) ||
+        (output_needed && output_device == kAudioObjectUnknown)) {
+      LOGE() << "Could not resolve the requested physical audio route";
+      return rollback(input_needed ? kAudioEngineRecordingDeviceNotAvailableError
+                                   : kAudioEnginePlayoutDeviceNotAvailableError);
+    }
+
+    AudioObjectID target_device = kAudioObjectUnknown;
+    if (input_needed && output_needed && input_device != output_device) {
+      if (!DestroyAggregateDeviceIfNeeded()) {
+        LOGE() << "Previous aggregate cleanup is still pending";
+        return rollback(kAudioEngineStateTransitionError);
+      }
+      auto aggregate =
+          mac_audio_utils::CreatePrivateAggregateDevice(output_device, input_device);
+      if (!aggregate.has_value()) {
+        LOGE() << "Failed to create aggregate device, output=" << output_device
+               << " input=" << input_device;
+        return rollback(kAudioEngineRecordingDeviceNotAvailableError);
+      }
+      engine_aggregate_device_id_ = *aggregate;
+      target_device = *aggregate;
+      rollback_actions.push_back([this]() {
+        RTC_DCHECK_RUN_ON(thread_);
+        if (!DestroyAggregateDeviceIfNeeded()) {
+          LOGE() << "Aggregate cleanup remains pending after rollback";
+        }
+      });
+
+      const uint32_t output_device_output_channels =
+          mac_audio_utils::GetNumChannels(output_device, false);
+      const uint32_t input_device_output_channels =
+          mac_audio_utils::GetNumChannels(input_device, false);
+      const uint32_t output_device_input_channels =
+          mac_audio_utils::GetNumChannels(output_device, true);
+      const uint32_t input_device_input_channels =
+          mac_audio_utils::GetNumChannels(input_device, true);
+      if (output_device_output_channels == 0 ||
+          input_device_input_channels == 0) {
+        LOGE() << "Selected aggregate endpoints lost their required direction";
+        return rollback(input_device_input_channels == 0
+                            ? kAudioEngineRecordingDeviceNotAvailableError
+                            : kAudioEnginePlayoutDeviceNotAvailableError);
+      }
+
+      // The WebRTC render graph is mono. Duplicate it only across the selected
+      // output device's channels and explicitly silence any output channels
+      // contributed by the selected input device.
+      aggregate_output_channel_map.assign(
+          output_device_output_channels + input_device_output_channels, -1);
+      for (uint32_t channel = 0; channel < output_device_output_channels;
+           ++channel) {
+        aggregate_output_channel_map[channel] = 0;
+      }
+
+      // The selected input device follows the output subdevice in aggregate
+      // order. Select its first channel explicitly instead of accepting AUHAL's
+      // default channel zero, which may belong to a duplex output endpoint.
+      aggregate_input_channel_map = {
+          static_cast<SInt32>(output_device_input_channels)};
+      LOGI() << "Created aggregate device " << target_device
+             << " (output=" << output_device << ", input=" << input_device << ")";
+    } else if (input_needed) {
+      target_device = input_device;
+    } else if (output_needed) {
+      target_device = output_device;
+    }
+
+    auto device_name = mac_audio_utils::GetDeviceName(target_device);
+    LOGI() << "Setting shared I/O unit device: "
+           << device_name.value_or("Unknown") << " (" << target_device << ")";
+    AudioUnit io_unit =
+        output_needed ? outputNode().audioUnit : inputNode().audioUnit;
+    OSStatus err = AudioUnitSetProperty(
+        io_unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global,
+        0, &target_device, sizeof(target_device));
+    if (err != noErr) {
+      LOGE() << "Failed to set shared I/O unit device: requested="
+             << target_device << ", error: " << err;
+      return rollback(input_needed ? kAudioEngineRecordingDeviceNotAvailableError
+                                   : kAudioEnginePlayoutDeviceNotAvailableError);
+    }
+
+    AudioObjectID effective_device = kAudioObjectUnknown;
+    UInt32 effective_device_size = sizeof(effective_device);
+    err = AudioUnitGetProperty(
+        io_unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global,
+        0, &effective_device, &effective_device_size);
+    if (err != noErr || effective_device != target_device) {
+      LOGE() << "Shared I/O unit device readback mismatch: requested="
+             << target_device << " effective=" << effective_device
+             << " error=" << err;
+      return rollback(input_needed ? kAudioEngineRecordingDeviceNotAvailableError
+                                   : kAudioEnginePlayoutDeviceNotAvailableError);
+    }
+
+    // The unit renegotiates its formats from the new device asynchronously.
+    // Wait for non-zero channels and sample rates before wiring the graph.
+    constexpr int kMaxFormatAttempts = 200;
+    constexpr int64_t kFormatPollIntervalMs = 10;
+    bool format_ready = false;
+    for (int attempt = 0; attempt < kMaxFormatAttempts; ++attempt) {
+      AVAudioFormat* output_format =
+          output_needed ? [outputNode() outputFormatForBus:0] : nil;
+      AVAudioFormat* input_format =
+          input_needed ? [inputNode() outputFormatForBus:0] : nil;
+      bool output_ready = !output_needed ||
+                          (output_format.channelCount > 0 &&
+                           output_format.sampleRate > 0);
+      bool input_ready = !input_needed ||
+                         (input_format.channelCount > 0 &&
+                          input_format.sampleRate > 0);
+      if (output_ready && input_ready) {
+        format_ready = true;
+        break;
+      }
+      webrtc::Thread::SleepMs(kFormatPollIntervalMs);
+    }
+    if (!format_ready) {
+      LOGE() << "Shared I/O unit formats did not become ready for device "
+             << target_device;
+      return rollback(input_needed ? kAudioEngineRecordingDeviceNotAvailableError
+                                   : kAudioEnginePlayoutDeviceNotAvailableError);
+    }
+  }
+#endif
+
+  // --------------------------------------------------------------------------------------------
   // Step: Enable output
   //
   if (state.next.IsOutputEnabled() &&
       (!state.prev.IsOutputEnabled() || state.IsEngineRecreateRequired())) {
     LOGI() << "Enabling output for AVAudioEngine...";
     RTC_DCHECK(!engine_device_.running);
+    playout_callback_count_.store(0, std::memory_order_relaxed);
+    last_playout_callback_mach_ticks_.store(0, std::memory_order_relaxed);
 
     AVAudioFormat* output_node_format = [outputNode() outputFormatForBus:0];
 
@@ -2422,11 +2727,20 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
                   AudioBufferList* outputData) {
           RTC_DCHECK(outputData->mNumberBuffers == 1);
 
+          last_playout_callback_mach_ticks_.store(
+              mach_absolute_time(), std::memory_order_relaxed);
+          playout_callback_count_.fetch_add(1, std::memory_order_relaxed);
+
           int16_t* dest_buffer = (int16_t*)outputData->mBuffers[0].mData;
 
+          const uint16_t playout_delay_ms = CallbackDelayMs(
+              timestamp, machTickUnitsToNanoseconds_, true,
+              playout_hardware_delay_ms_.load(std::memory_order_relaxed));
+          measured_playout_delay_ms_.store(playout_delay_ms,
+                                           std::memory_order_relaxed);
           fine_audio_buffer_->GetPlayoutData(
               webrtc::ArrayView<int16_t>(static_cast<int16_t*>(dest_buffer), frameCount),
-              kFixedPlayoutDelayEstimate);
+              playout_delay_ms);
 
           return noErr;
         };
@@ -2463,6 +2777,16 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       return rollback(kAudioEngineDeviceFormatError);
     }
 
+#if TARGET_OS_OSX
+    if (!aggregate_output_channel_map.empty() &&
+        !SetAndVerifyAudioUnitChannelMap(
+            outputNode().audioUnit, kAudioUnitScope_Input, 0,
+            aggregate_output_channel_map)) {
+      LOGE() << "Failed to install or verify aggregate output channel map";
+      return rollback(kAudioEngineDeviceFormatError);
+    }
+#endif
+
     if (this->observer_ != nullptr) {
       NSDictionary* context = @{};
       int32_t result =
@@ -2473,6 +2797,10 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
         return rollback(result);
       }
     }
+
+    playout_hardware_delay_ms_.store(
+        SaturatingDelayMs(outputNode().presentationLatency * 1000.0),
+        std::memory_order_relaxed);
 
   } else if ((state.prev.IsOutputEnabled() && !state.next.IsOutputEnabled()) &&
              !state.IsEngineRecreateRequired()) {
@@ -2492,6 +2820,10 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       }
       source_node_ = nil;
     }
+    playout_hardware_delay_ms_.store(0, std::memory_order_relaxed);
+    measured_playout_delay_ms_.store(0, std::memory_order_relaxed);
+    playout_callback_count_.store(0, std::memory_order_relaxed);
+    last_playout_callback_mach_ticks_.store(0, std::memory_order_relaxed);
   }
 
   // --------------------------------------------------------------------------------------------
@@ -2501,6 +2833,8 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       (!state.prev.IsInputEnabled() || state.IsEngineRecreateRequired())) {
     LOGI() << "Enabling input for AVAudioEngine...";
     RTC_DCHECK(!engine_device_.running);
+    recording_callback_count_.store(0, std::memory_order_relaxed);
+    last_recording_callback_mach_ticks_.store(0, std::memory_order_relaxed);
 
     // Apple: When the engine renders to and from an audio device, the AVAudioSession category and
     // the availability of hardware determines whether an app performs input (for example, input
@@ -2609,6 +2943,10 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
                   const AudioBufferList* inputData) {
           RTC_DCHECK(inputData->mNumberBuffers == 1);
 
+          last_recording_callback_mach_ticks_.store(
+              mach_absolute_time(), std::memory_order_relaxed);
+          recording_callback_count_.fetch_add(1, std::memory_order_relaxed);
+
           AudioBufferList* converter_buffer_abl =
               const_cast<AudioBufferList*>(converter_buffer_.audioBufferList);
           RTC_DCHECK(converter_buffer_abl->mNumberBuffers == inputData->mNumberBuffers);
@@ -2625,11 +2963,23 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
           RTC_DCHECK(err == noErr);
 
           const int16_t* rtc_buffer = (int16_t*)converter_buffer_abl->mBuffers[0].mData;  // Float32
-          const int64_t capture_time_ns = timestamp->mHostTime * machTickUnitsToNanoseconds_;
+          const int64_t capture_time_ns =
+              (timestamp != nullptr &&
+               (timestamp->mFlags & kAudioTimeStampHostTimeValid) != 0)
+                  ? static_cast<int64_t>(timestamp->mHostTime *
+                                         machTickUnitsToNanoseconds_)
+                  : 0;
+          const uint16_t record_delay_ms = CallbackDelayMs(
+              timestamp, machTickUnitsToNanoseconds_, false,
+              record_hardware_delay_ms_.load(std::memory_order_relaxed));
+          measured_record_delay_ms_.store(record_delay_ms,
+                                          std::memory_order_relaxed);
 
           fine_audio_buffer_->DeliverRecordedData(
-              webrtc::ArrayView<const int16_t>(rtc_buffer, frameCount), kFixedRecordDelayEstimate,
-              capture_time_ns);
+              webrtc::ArrayView<const int16_t>(rtc_buffer, frameCount),
+              record_delay_ms,
+              capture_time_ns != 0 ? std::make_optional(capture_time_ns)
+                                   : std::nullopt);
 
           return noErr;
         };
@@ -2668,6 +3018,16 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       return rollback(kAudioEngineDeviceFormatError);
     }
 
+#if TARGET_OS_OSX
+    if (!aggregate_input_channel_map.empty() &&
+        !SetAndVerifyAudioUnitChannelMap(
+            inputNode().audioUnit, kAudioUnitScope_Output, 1,
+            aggregate_input_channel_map)) {
+      LOGE() << "Failed to install or verify aggregate input channel map";
+      return rollback(kAudioEngineDeviceFormatError);
+    }
+#endif
+
     sink_node_ = [[AVAudioSinkNode alloc] initWithReceiverBlock:sink_block];
     [engine_device_ attachNode:sink_node_];
 
@@ -2690,6 +3050,10 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
       LOGE() << "Failed to connect input mixer to sink node: " << exception.reason.UTF8String;
       return rollback(kAudioEngineDeviceFormatError);
     }
+
+    record_hardware_delay_ms_.store(
+        SaturatingDelayMs(inputNode().presentationLatency * 1000.0),
+        std::memory_order_relaxed);
 
   } else if ((state.prev.IsInputEnabled() && !state.next.IsInputEnabled()) &&
              !state.IsEngineRecreateRequired()) {
@@ -2730,6 +3094,10 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
         sink_node_ = nil;
       }
     }
+    record_hardware_delay_ms_.store(0, std::memory_order_relaxed);
+    measured_record_delay_ms_.store(0, std::memory_order_relaxed);
+    recording_callback_count_.store(0, std::memory_order_relaxed);
+    last_recording_callback_mach_ticks_.store(0, std::memory_order_relaxed);
 
     // Dispose Float32 -> Int16 converter.
     if (converter_ref_ != nullptr) {
@@ -2824,10 +3192,14 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
   }
 
   // --------------------------------------------------------------------------------------------
-  // Step: Configure device (macOS only)
+  // Step: Configure device (macOS, voice processing enabled)
   //
+  // With voice processing the input and output nodes use separate I/O units
+  // that accept per-direction device selection at this point. The non voice
+  // processing path configures its shared unit earlier, before the graph is
+  // wired (see "Configure device for the shared I/O unit" above).
 #if TARGET_OS_OSX
-  if (state.next.IsAnyEnabled() &&
+  if (state.next.voice_processing_enabled && state.next.IsAnyEnabled() &&
       (!state.prev.IsAnyEnabled() || state.IsEngineRecreateRequired())) {
     if (state.next.IsInputEnabled()) {
       uint32_t requested_input_device_id = state.next.input_device_id;
@@ -2987,6 +3359,20 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
           }
         });
 
+#if TARGET_OS_OSX
+        if ((!aggregate_output_channel_map.empty() &&
+             !VerifyAudioUnitChannelMap(
+                 outputNode().audioUnit, kAudioUnitScope_Input, 0,
+                 aggregate_output_channel_map)) ||
+            (!aggregate_input_channel_map.empty() &&
+             !VerifyAudioUnitChannelMap(
+                 inputNode().audioUnit, kAudioUnitScope_Output, 1,
+                 aggregate_input_channel_map))) {
+          LOGE() << "Aggregate channel map changed while starting the engine";
+          return rollback(kAudioEngineDeviceFormatError);
+        }
+#endif
+
         RTC_DCHECK(configuration_observer_ == nullptr);
         // Add observer for configuration changes
         NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
@@ -3060,6 +3446,20 @@ int32_t AudioEngineDevice::ApplyDeviceEngineState(EngineStateUpdate state) {
 
     LOGI() << "Releasing AVAudioEngine...";
     engine_device_ = nil;
+    playout_hardware_delay_ms_.store(0, std::memory_order_relaxed);
+    measured_playout_delay_ms_.store(0, std::memory_order_relaxed);
+    record_hardware_delay_ms_.store(0, std::memory_order_relaxed);
+    measured_record_delay_ms_.store(0, std::memory_order_relaxed);
+    playout_callback_count_.store(0, std::memory_order_relaxed);
+    last_playout_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+    recording_callback_count_.store(0, std::memory_order_relaxed);
+    last_recording_callback_mach_ticks_.store(0, std::memory_order_relaxed);
+#if TARGET_OS_OSX
+    if (!DestroyAggregateDeviceIfNeeded()) {
+      LOGE() << "Failed to destroy aggregate while releasing engine";
+      return rollback(kAudioEngineStateTransitionError);
+    }
+#endif
   }
 
   // --- Diagnostic: final state after apply ---
@@ -3104,7 +3504,7 @@ void AudioEngineDevice::StartRenderLoop() {
 
     // Call GetPlayoutData to pull frames into rtc audio stack even though we won't use it here.
     fine_audio_buffer_->GetPlayoutData(
-        webrtc::ArrayView<int16_t>(read_rtc_buffer, frames_per_buffer), kFixedPlayoutDelayEstimate);
+        webrtc::ArrayView<int16_t>(read_rtc_buffer, frames_per_buffer), 0);
 
     // Render (Input)
     RTC_DCHECK(render_buffer_ != nullptr);
@@ -3124,7 +3524,7 @@ void AudioEngineDevice::StartRenderLoop() {
 
       fine_audio_buffer_->DeliverRecordedData(
           webrtc::ArrayView<const int16_t>(rtc_buffer, frames_per_buffer),
-          kFixedRecordDelayEstimate, capture_time_ns);
+          0, capture_time_ns);
     } else {
       LOGW() << "Render error: " << err << " frames: " << frames_per_buffer;
     }
@@ -3144,6 +3544,54 @@ void AudioEngineDevice::StartRenderLoop() {
 // Private - Device access
 
 #if TARGET_OS_OSX
+
+bool AudioEngineDevice::RemoveAudioDeviceListeners() {
+  RTC_DCHECK_RUN_ON(thread_);
+  struct ListenerRegistration {
+    AudioObjectPropertySelector selector;
+    bool* registered;
+  };
+  ListenerRegistration registrations[] = {
+      {kAudioHardwarePropertyDefaultInputDevice,
+       &default_input_listener_registered_},
+      {kAudioHardwarePropertyDefaultOutputDevice,
+       &default_output_listener_registered_},
+      {kAudioHardwarePropertyDevices, &devices_listener_registered_},
+  };
+
+  bool removed_all = true;
+  for (ListenerRegistration& registration : registrations) {
+    if (!*registration.registered) {
+      continue;
+    }
+    AudioObjectPropertyAddress property_address = {
+        registration.selector, kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain};
+    OSStatus status = AudioObjectRemovePropertyListener(
+        kAudioObjectSystemObject, &property_address, &objectListenerProc, this);
+    if (status == noErr) {
+      *registration.registered = false;
+    } else {
+      removed_all = false;
+      LOGE() << "Failed to remove audio-device listener "
+             << registration.selector << ", error: " << status;
+    }
+  }
+  return removed_all;
+}
+
+bool AudioEngineDevice::DestroyAggregateDeviceIfNeeded() {
+  RTC_DCHECK_RUN_ON(thread_);
+  if (engine_aggregate_device_id_ == kAudioObjectUnknown) {
+    return true;
+  }
+  LOGI() << "Destroying aggregate device " << engine_aggregate_device_id_;
+  if (!mac_audio_utils::DestroyAggregateDevice(engine_aggregate_device_id_)) {
+    return false;
+  }
+  engine_aggregate_device_id_ = kAudioObjectUnknown;
+  return true;
+}
 
 void AudioEngineDevice::UpdateAllDeviceIDs() {
   using namespace webrtc::mac_audio_utils;

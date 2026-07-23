@@ -128,6 +128,21 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
     AudioDuckingLevelMax = 3,
   };
 
+  // Realtime callback truth for physical I/O health. Counts and ages are scoped
+  // to the current AudioEngine graph generation: every directional graph
+  // rebuild resets them so a callback from a retired route cannot make the new
+  // route appear healthy.
+  struct RuntimeDiagnostics {
+    bool playout_callback_seen = false;
+    bool recording_callback_seen = false;
+    uint64_t playout_callback_count = 0;
+    uint64_t recording_callback_count = 0;
+    uint64_t playout_callback_age_ms = 0;
+    uint64_t recording_callback_age_ms = 0;
+    uint16_t measured_playout_delay_ms = 0;
+    uint16_t measured_recording_delay_ms = 0;
+  };
+
   // Represents the state of the audio engine, including input/output status,
   // rendering mode, and various configuration flags.
   struct EngineState {
@@ -364,6 +379,8 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
   int32_t SetEngineState(EngineState enable);
   int32_t GetEngineState(EngineState* enabled);
 
+  RuntimeDiagnostics GetRuntimeDiagnostics() const;
+
   int32_t SetEngineAvailability(bool input_available, bool output_available);
   int32_t EngineAvailability(bool* input_available, bool* output_available);
 
@@ -510,6 +527,16 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
   std::vector<AudioObjectID> output_device_ids_;
   std::vector<std::string> output_device_labels_;
   std::vector<std::string> input_device_labels_;
+
+  bool devices_listener_registered_ = false;
+  bool default_output_listener_registered_ = false;
+  bool default_input_listener_registered_ = false;
+  bool RemoveAudioDeviceListeners();
+
+  // Private aggregate device used when voice processing is disabled and the
+  // engine's shared I/O unit must address different input and output devices.
+  AudioObjectID engine_aggregate_device_id_ = kAudioObjectUnknown;
+  bool DestroyAggregateDeviceIfNeeded();
 #endif
 
   bool IsMicrophonePermissionGranted();
@@ -564,10 +591,18 @@ class AudioEngineDevice : public AudioDeviceModule, public AudioSessionObserver 
 
   // Output related
   AVAudioSourceNode* source_node_ RTC_GUARDED_BY(thread_);
+  std::atomic<uint16_t> playout_hardware_delay_ms_{0};
+  std::atomic<uint16_t> measured_playout_delay_ms_{0};
+  std::atomic<uint64_t> playout_callback_count_{0};
+  std::atomic<uint64_t> last_playout_callback_mach_ticks_{0};
 
   // Input related nodes
   AVAudioSinkNode* sink_node_ RTC_GUARDED_BY(thread_);
   AVAudioMixerNode* input_mixer_node_ RTC_GUARDED_BY(thread_);
+  std::atomic<uint16_t> record_hardware_delay_ms_{0};
+  std::atomic<uint16_t> measured_record_delay_ms_{0};
+  std::atomic<uint64_t> recording_callback_count_{0};
+  std::atomic<uint64_t> last_recording_callback_mach_ticks_{0};
 
   // Float32 -> Int16 converter.
   AudioConverterRef converter_ref_ = nullptr;

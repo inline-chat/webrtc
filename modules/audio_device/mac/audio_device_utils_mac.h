@@ -44,6 +44,10 @@ std::optional<std::string> GetDeviceLabel(AudioObjectID device_id,
 
 uint32_t GetNumStreams(AudioObjectID device_id, bool is_input);
 
+// Returns the total channel count published by all streams in the requested
+// direction. Aggregate subdevices are flattened in subdevice order.
+uint32_t GetNumChannels(AudioObjectID device_id, bool is_input);
+
 std::optional<uint32_t> GetDeviceSource(AudioObjectID device_id, bool is_input);
 
 std::optional<uint32_t> GetDeviceTransportType(AudioObjectID device_id);
@@ -51,6 +55,26 @@ std::optional<uint32_t> GetDeviceTransportType(AudioObjectID device_id);
 bool IsInputDevice(AudioObjectID device_id);
 
 bool IsOutputDevice(AudioObjectID device_id);
+
+// Creates a private (process local) aggregate device combining the given
+// output and input devices, so a single HAL I/O unit can address both. The
+// output device is the clock master and drift compensation is enabled for
+// the input sub device. Returns the aggregate AudioObjectID on success.
+std::optional<AudioObjectID> CreatePrivateAggregateDevice(
+    AudioObjectID output_device_id,
+    AudioObjectID input_device_id);
+
+// Verifies that an aggregate contains exactly the requested output and input
+// devices in that order, uses the output as its time source, has input drift
+// compensation enabled, and publishes streams in both directions.
+bool VerifyPrivateAggregateDevice(AudioObjectID aggregate_device_id,
+                                  AudioObjectID output_device_id,
+                                  AudioObjectID input_device_id);
+
+// Destroys an aggregate device created by CreatePrivateAggregateDevice.
+// Core Audio destroys aggregates asynchronously; success means the object has
+// also disappeared before the bounded verification deadline.
+bool DestroyAggregateDevice(AudioObjectID aggregate_device_id);
 
 }  // namespace mac_audio_utils
 }  // namespace webrtc

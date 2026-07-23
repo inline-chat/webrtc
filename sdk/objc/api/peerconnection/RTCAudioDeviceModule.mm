@@ -254,11 +254,10 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
       }
     }
 
-    if (_native->SetPlayoutDevice(index)) {
-      return YES;
-    }
-
-    return NO;
+    // AudioDeviceModule methods use zero for success. Preserve that contract
+    // when exposing a Cocoa Boolean instead of inverting every successful
+    // route selection.
+    return _native->SetPlayoutDevice(index) == 0;
   });
 }
 
@@ -299,11 +298,7 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
       }
     }
 
-    if (_native->SetRecordingDevice(index)) {
-      return YES;
-    }
-
-    return NO;
+    return _native->SetRecordingDevice(index) == 0;
   });
 }
 
@@ -384,6 +379,34 @@ class AudioDeviceObserver : public webrtc::AudioDeviceObserver {
   if (module == nullptr) return false;
 
   return _workerThread->BlockingCall([module] { return module->IsEngineRunning(); });
+}
+
+- (RTC_OBJC_TYPE(RTCAudioEngineRuntimeDiagnostics))audioEngineRuntimeDiagnostics {
+  webrtc::AudioEngineDevice *module =
+      AudioEngineDeviceOrNull(_native.get(), _audioDeviceModuleType);
+  if (module == nullptr) {
+    RTC_OBJC_TYPE(RTCAudioEngineRuntimeDiagnostics) diagnostics = {};
+    return diagnostics;
+  }
+
+  return _workerThread->BlockingCall([module] {
+    const webrtc::AudioEngineDevice::RuntimeDiagnostics native =
+        module->GetRuntimeDiagnostics();
+    RTC_OBJC_TYPE(RTCAudioEngineRuntimeDiagnostics) diagnostics = {};
+    diagnostics.playoutCallbackSeen = native.playout_callback_seen;
+    diagnostics.recordingCallbackSeen = native.recording_callback_seen;
+    diagnostics.playoutCallbackCount = native.playout_callback_count;
+    diagnostics.recordingCallbackCount = native.recording_callback_count;
+    diagnostics.playoutCallbackAgeMilliseconds =
+        native.playout_callback_age_ms;
+    diagnostics.recordingCallbackAgeMilliseconds =
+        native.recording_callback_age_ms;
+    diagnostics.measuredPlayoutDelayMilliseconds =
+        native.measured_playout_delay_ms;
+    diagnostics.measuredRecordingDelayMilliseconds =
+        native.measured_recording_delay_ms;
+    return diagnostics;
+  });
 }
 
 - (BOOL)isMicrophoneMuted {
