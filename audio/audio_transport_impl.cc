@@ -283,6 +283,15 @@ void AudioTransportImpl::PullRenderData(int bits_per_sample,
                                     number_of_frames, number_of_channels));
 }
 
+int32_t AudioTransportImpl::OnAudioRouteChanged() {
+  // The ADM guarantees that native render and capture callbacks are quiescent
+  // for this call. Reinitializing APM clears AEC render history, delay state,
+  // and adaptive filters that belong to the previous physical acoustic path,
+  // while retaining the caller's configured processing policy.
+  return audio_processing_ ? audio_processing_->Initialize()
+                           : AudioProcessing::kNoError;
+}
+
 void AudioTransportImpl::UpdateAudioSenders(std::vector<AudioSender*> senders,
                                             int send_sample_rate_hz,
                                             size_t send_num_channels) {

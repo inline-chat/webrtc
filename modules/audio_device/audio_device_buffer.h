@@ -94,6 +94,11 @@ class AudioDeviceBuffer {
   void StopPlayout();
   void StopRecording();
 
+  // Notifies the registered transport while both native directions are
+  // stopped. Returns the transport's error so the device transaction can fail
+  // before callbacks resume on an incoherent processing state.
+  int32_t NotifyAudioRouteChanged();
+
   bool IsPlaying();
   bool IsRecording();
 

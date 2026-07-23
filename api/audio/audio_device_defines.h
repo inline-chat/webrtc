@@ -86,6 +86,11 @@ class AudioTransport {
                               int64_t* elapsed_time_ms,
                               int64_t* ntp_time_ms) = 0;
 
+  // Called after native capture and playout callbacks have quiesced and before
+  // they resume on a different physical route. Implementations may clear
+  // processing state that is only valid for the previous acoustic path.
+  virtual int32_t OnAudioRouteChanged() { return 0; }
+
  protected:
   virtual ~AudioTransport() {}
 };

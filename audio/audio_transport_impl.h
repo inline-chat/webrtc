@@ -85,6 +85,8 @@ class AudioTransportImpl : public AudioTransport {
                       int64_t* elapsed_time_ms,
                       int64_t* ntp_time_ms) override;
 
+  int32_t OnAudioRouteChanged() override;
+
   void UpdateAudioSenders(std::vector<AudioSender*> senders,
                           int send_sample_rate_hz,
                           size_t send_num_channels);

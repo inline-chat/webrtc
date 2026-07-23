@@ -201,6 +201,14 @@ void AudioDeviceBuffer::StopRecording() {
   RTC_LOG(LS_INFO) << "total recording time: " << time_since_start;
 }
 
+int32_t AudioDeviceBuffer::NotifyAudioRouteChanged() {
+  RTC_DCHECK_RUN_ON(&main_thread_checker_);
+  RTC_DCHECK(!playing_);
+  RTC_DCHECK(!recording_);
+  RTC_LOG(LS_INFO) << "AudioDeviceBuffer::NotifyAudioRouteChanged";
+  return audio_transport_cb_ ? audio_transport_cb_->OnAudioRouteChanged() : 0;
+}
+
 bool AudioDeviceBuffer::IsPlaying() {
   RTC_DCHECK_RUN_ON(&main_thread_checker_);
   return playing_;
